@@ -1297,7 +1297,7 @@ BEGIN
                 credit_account_id as account_id,
                 SUM(amount) as total_credit
             FROM idl.bridge_account_transaction bat
-            WHERE bat.load_date = TRUNC(v_load_timestamp)
+--            WHERE bat.load_date = TRUNC(v_load_timestamp)
             GROUP BY credit_account_id
         ) credit_sums ON ha.account_id = credit_sums.account_id
         LEFT JOIN (
@@ -1305,9 +1305,9 @@ BEGIN
                 account_id,
                 COUNT(*) as txn_count
             FROM (
-                SELECT debit_account_id as account_id FROM idl.bridge_account_transaction WHERE load_date = TRUNC(v_load_timestamp)
+                SELECT debit_account_id as account_id FROM idl.bridge_account_transaction --WHERE load_date = TRUNC(v_load_timestamp)
                 UNION ALL
-                SELECT credit_account_id as account_id FROM idl.bridge_account_transaction WHERE load_date = TRUNC(v_load_timestamp)
+                SELECT credit_account_id as account_id FROM idl.bridge_account_transaction --WHERE load_date = TRUNC(v_load_timestamp)
             )
             GROUP BY account_id
         ) txn_counts ON ha.account_id = txn_counts.account_id
@@ -1320,13 +1320,13 @@ BEGIN
                     debit_account_id as account_id,
                     transaction_date
                 FROM idl.bridge_account_transaction 
-                WHERE load_date = TRUNC(v_load_timestamp)
+--                WHERE load_date = TRUNC(v_load_timestamp)
                 UNION ALL
                 SELECT 
                     credit_account_id as account_id,
                     transaction_date
                 FROM idl.bridge_account_transaction 
-                WHERE load_date = TRUNC(v_load_timestamp)
+ --               WHERE load_date = TRUNC(v_load_timestamp)
             )
             GROUP BY account_id
         ) last_txn ON ha.account_id = last_txn.account_id;
