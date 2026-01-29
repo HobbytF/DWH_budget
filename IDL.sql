@@ -22,6 +22,29 @@ CREATE INDEX idx_bridge_acc_txn_date ON IDL.bridge_account_transaction (transact
 CREATE INDEX idx_bridge_acc_txn_debit ON IDL.bridge_account_transaction (debit_account_id);
 CREATE INDEX idx_bridge_acc_txn_credit ON IDL.bridge_account_transaction (credit_account_id);
 
+-- 1.1. Бридж для связи счетов с транзакциями
+CREATE TABLE IDL.bridge_transaction_account (
+    transaction_hash_key    VARCHAR2(64),
+    transaction_id          NUMBER(10) NOT NULL,
+    transaction_date        DATE NOT NULL,
+    amount                  NUMBER(10,2) NOT NULL,
+    debit_account_id        VARCHAR2(16) NOT NULL,
+    debit_account_hash_key  VARCHAR2(64),
+    credit_account_id       VARCHAR2(16) NOT NULL,
+    credit_account_hash_key VARCHAR2(64),
+    effective_date_from     DATE NOT NULL,
+    effective_date_to       DATE NOT NULL,
+    hash_key                VARCHAR2(64),
+    
+    CONSTRAINT pk_bridge_acc_txn PRIMARY KEY (hash_key)
+);
+
+-- Индексы для ускорения запросов
+CREATE INDEX idx_bridge_acc_txa_date ON IDL.bridge_transaction_account (transaction_date);
+CREATE INDEX idx_bridge_acc_txa_debit ON IDL.bridge_transaction_account (debit_account_id);
+CREATE INDEX idx_bridge_acc_txa_credit ON IDL.bridge_transaction_account (credit_account_id);
+
+
 -- 2. Бридж для иерархии счетов
 CREATE TABLE IDL.bridge_account_hierarchy (
     account_id              VARCHAR2(16) NOT NULL,
