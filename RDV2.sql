@@ -77,6 +77,7 @@ BEGIN
           END;
       END;
   END LOOP;
+  commit;
   DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
   DBMS_OUTPUT.PUT_LINE('Статистика:');
   DBMS_OUTPUT.PUT_LINE('  - Обновлено в спутнике: ' || v_sat_updated);
