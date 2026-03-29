@@ -52,6 +52,7 @@ CREATE TABLE RDV2.l_account_account (
     parent_child_account_rk   VARCHAR2(64) PRIMARY KEY,
     parent_account_rk         VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (родитель)
     child_account_rk          VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (потомок)
+    
     valid_from                DATE,                  -- Дата начала действия записи
     valid_to                  DATE,                  -- Дата окончания действия записи
     valid_flg                 CHAR(1),               -- Флаг валидности
@@ -70,8 +71,10 @@ DECLARE
     v_records_processed NUMBER := 0;
     v_sat_updated       NUMBER := 0;
     v_sat_inserted      NUMBER := 0;
+    v_src               VARCHAR2(10) := 'YAST';
+    v_days_ago          NUMBER(5) := 30;
 BEGIN
-  DBMS_OUTPUT.PUT_LINE('Начало загрузки сателлита счета: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки сателлита счета по источнику ' || v_src || ': ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
   FOR X in (
     select LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) as account_rk, 
       v_load_timestamp as valid_from, 
@@ -80,13 +83,16 @@ BEGIN
       sa.START_BALANCE,
       '1' as valid_flg,
       v_load_timestamp as load_date,
-      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || sa.START_BALANCE, 'MD5')) as hash_diff,
-      'STG_ACCOUNT' as record_source
+      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99'), 'MD5')) as hash_diff,
+      v_src as record_source
     from stg.STG_ACCOUNT sa 
     where not EXISTS
       (select 1 from RDV2.S_ACCOUNT sat where
-      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || sa.START_BALANCE, 'MD5')) = sat.HASH_DIFF
-      and sat.valid_flg = '1')
+        LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99'), 'MD5')) = sat.HASH_DIFF
+        and sat.valid_flg = '1'  and sat.RECORD_SOURCE = v_src
+      )
+      and sa.RECORD_SOURCE = v_src
+      and sa.LOAD_DATE > TRUNC(sysdate) - v_days_ago
   )
   LOOP
       BEGIN
@@ -95,11 +101,11 @@ BEGIN
           BEGIN
             -- Пытаемся найти старую запись
             select count(*) into v_cnt from RDV2.S_ACCOUNT sat
-            where sat.account_rk = x.account_rk and sat.VALID_FLG = '1';
+            where sat.account_rk = x.account_rk and sat.VALID_FLG = '1' and sat.record_source = x.record_source;
             -- Если старая запись нашлась, то обновляем ее
             IF v_cnt > 0 THEN
               UPDATE RDV2.S_ACCOUNT sat set sat.VALID_FLG = '0', sat.valid_to = v_load_timestamp
-              where sat.account_rk = x.account_rk and sat.VALID_FLG = '1';
+              where sat.account_rk = x.account_rk and sat.VALID_FLG = '1' and sat.record_source = x.record_source;
               v_sat_updated := v_sat_updated + 1;
             END IF;
             -- создаем новую версию
@@ -218,7 +224,7 @@ BEGIN
   select LOWER(STANDARD_HASH(t.account_id, 'MD5')) as account_rk,
     t.account_id,
     SYSDATE load_date,
-    'STG_ACCOUNT' record_source
+    'YAST' record_source
   from STG.STG_ACCOUNT t 
   where not exists 
   (select 1 from RDV2.H_ACCOUNT rt where rt.account_id = t.account_id))
@@ -258,7 +264,7 @@ BEGIN
             TO_DATE('2999.12.31','yyyy.mm.dd') as valid_to,
             '1' as valid_flg,
             v_load_timestamp as load_date,
-            'STG_ACCOUNT' as record_source
+            'YAST' as record_source
         from stg.stg_account
         where SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) is not null
         and not EXISTS (
@@ -308,3 +314,15 @@ END;
 
 select * from RDV2.H_TRANSACTION where transaction_id = 3401;
 delete from RDV2.H_TRANSACTION where transaction_id > 3390;
+
+DECLARE
+st varchar2(100):='';
+BEGIN
+  select  --LOWER(STANDARD_HASH(sa.ACCOUNT_ID || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE), 'MD5')) 
+  LOWER(STANDARD_HASH(sa.ACCOUNT_ID || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99') , 'MD5'))
+  into st
+    from stg.STG_ACCOUNT sa
+    where sa.ACCOUNT_ID = '2.1.';
+  DBMS_OUTPUT.PUT_LINE(st);
+END;
+/
