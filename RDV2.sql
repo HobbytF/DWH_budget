@@ -32,6 +32,31 @@ CREATE TABLE RDV2.s_account (
     PRIMARY KEY (account_rk, valid_from)
 );
 
+-- СОЗДАНИЕ ЛИНКА ДЛЯ СВЯЗИ ТРАНЗАКЦИИ СО СЧЕТАМИ
+CREATE TABLE RDV2.l_transation_account (
+    transaction_debacc_credacc_rk   VARCHAR2(64),         -- ХЭШ от связки ключей
+    transaction_rk                  VARCHAR2(64),         -- Ссылка на хаб транзакций
+    debit_account_rk                VARCHAR2(64),         -- Ссылка на хаб счетов
+    credit_account_rk               VARCHAR2(64),         -- Ссылка на хаб счетов
+    load_date                       DATE,                 -- Дата загрузки записи
+    record_source                   VARCHAR2(50),         -- Источник записи
+    PRIMARY KEY (transaction_debacc_credacc_rk)    
+);
+
+-- СОЗДАНИЕ САТТЕЛИТА ДЛЯ СВЯЗИ ТРАНЗАКЦИИ СО СЧЕТОМ
+CREATE TABLE RDV2.s_transation_account (
+    transaction_debacc_credacc_rk   VARCHAR2(64),         -- Ссылка на линк связи транзакций и счетов
+    valid_from                      DATE,                 -- Дата начала действия записи
+    valid_to                        DATE,                 -- Дата окончания действия записи
+    transaction_date                DATE,                 -- Дата транзакции
+    amount                          NUMBER(10,2),         -- Сумма транзакции
+    valid_flg                       CHAR(1),              -- Флаг валидности
+    load_date                       DATE,                 -- Дата загрузки записи
+    hash_diff                       VARCHAR2(64) NOT NULL,-- Хэш по ключам transaction_debacc_credacc_rk, valid_from, transaction_date, amount
+    record_source                   VARCHAR2(50),         -- Источник записи
+    PRIMARY KEY (transaction_debacc_credacc_rk, valid_from)    
+);
+
 -- СОЗДАНИЕ САТТЕЛИТА ДЛЯ ТРАНЗАКЦИЙ
 CREATE TABLE RDV2.s_transaction (
     transaction_rk    VARCHAR2(64),         -- Ссылка на хаб транзакций
@@ -188,13 +213,14 @@ DECLARE
   v_load_timestamp    DATE := SYSDATE;
   v_hub_inserted NUMBER(10) := 0;
   v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
 BEGIN
   DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба транзакции: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
   for X in (
   select LOWER(STANDARD_HASH(t.transaction_id, 'MD5')) as transaction_rk,
     t.TRANSACTION_ID,
-    SYSDATE load_date,
-    'STG_TRANSACTION' record_source
+    v_load_timestamp load_date,
+    v_src record_source
   from STG.STG_TRANSACTION t 
   where not exists 
   (select 1 from RDV2.H_TRANSACTION rt where rt.transaction_id = t.transaction_id))
@@ -218,13 +244,14 @@ DECLARE
   v_load_timestamp    DATE := SYSDATE;
   v_hub_inserted NUMBER(10) := 0;
   v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
 BEGIN
   DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба счетов: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
   for X in (
   select LOWER(STANDARD_HASH(t.account_id, 'MD5')) as account_rk,
     t.account_id,
-    SYSDATE load_date,
-    'YAST' record_source
+    v_load_timestamp load_date,
+    v_src record_source
   from STG.STG_ACCOUNT t 
   where not exists 
   (select 1 from RDV2.H_ACCOUNT rt where rt.account_id = t.account_id))
@@ -314,15 +341,3 @@ END;
 
 select * from RDV2.H_TRANSACTION where transaction_id = 3401;
 delete from RDV2.H_TRANSACTION where transaction_id > 3390;
-
-DECLARE
-st varchar2(100):='';
-BEGIN
-  select  --LOWER(STANDARD_HASH(sa.ACCOUNT_ID || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE), 'MD5')) 
-  LOWER(STANDARD_HASH(sa.ACCOUNT_ID || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99') , 'MD5'))
-  into st
-    from stg.STG_ACCOUNT sa
-    where sa.ACCOUNT_ID = '2.1.';
-  DBMS_OUTPUT.PUT_LINE(st);
-END;
-/
