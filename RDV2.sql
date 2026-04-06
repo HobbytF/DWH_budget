@@ -1,4 +1,3 @@
-
 -- СОЗДАНИЕ ХАБА СЧЕТОВ
 CREATE TABLE RDV2.h_account (
     account_rk          VARCHAR2(64) PRIMARY KEY, -- Хэш от бизнес-ключа (account_id)
@@ -6,8 +5,7 @@ CREATE TABLE RDV2.h_account (
     load_date           DATE NOT NULL,
     record_source       VARCHAR2(50) NOT NULL
 );
--- Уникальный индекс на бизнес-ключ
-CREATE UNIQUE INDEX RDV2.bk_h_account ON RDV2.h_account (account_id);
+CREATE UNIQUE INDEX RDV2.bk_h_account ON RDV2.h_account (account_id); -- Уникальный индекс на бизнес-ключ
 
 -- СОЗДАНИЕ ХАБА ТРАНЗАКЦИЙ
 CREATE TABLE RDV2.h_transaction (
@@ -52,12 +50,14 @@ CREATE TABLE RDV2.s_transation_account (
     amount                          NUMBER(10,2),         -- Сумма транзакции
     valid_flg                       CHAR(1),              -- Флаг валидности
     load_date                       DATE,                 -- Дата загрузки записи
-    hash_diff                       VARCHAR2(64) NOT NULL,-- Хэш по ключам transaction_debacc_credacc_rk, valid_from, transaction_date, amount
+    hash_diff                       VARCHAR2(64) NOT NULL,-- Хэш по ключам transaction_debacc_credacc_rk, transaction_date, amount
     record_source                   VARCHAR2(50),         -- Источник записи
     PRIMARY KEY (transaction_debacc_credacc_rk, valid_from)    
 );
 
+drop table RDV2.s_transaction;
 -- СОЗДАНИЕ САТТЕЛИТА ДЛЯ ТРАНЗАКЦИЙ
+/*
 CREATE TABLE RDV2.s_transaction (
     transaction_rk    VARCHAR2(64),         -- Ссылка на хаб транзакций
     valid_from        DATE,                 -- Дата начала действия записи
@@ -70,14 +70,13 @@ CREATE TABLE RDV2.s_transaction (
     record_source     VARCHAR2(50),         -- Источник записи
     PRIMARY KEY (transaction_rk, valid_from)
 );
+*/
 
-drop TABLE RDV2.l_account_account;
--- Связь "Счет-Счет" для иерархии
+-- СОЗДАНИЕ СВЯЗИ "Счет-Счет" ДЛЯ ИЕРАРХИИ (надо пересмотреть)
 CREATE TABLE RDV2.l_account_account (
     parent_child_account_rk   VARCHAR2(64) PRIMARY KEY,
     parent_account_rk         VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (родитель)
     child_account_rk          VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (потомок)
-    
     valid_from                DATE,                  -- Дата начала действия записи
     valid_to                  DATE,                  -- Дата окончания действия записи
     valid_flg                 CHAR(1),               -- Флаг валидности
@@ -86,11 +85,74 @@ CREATE TABLE RDV2.l_account_account (
 );
 CREATE UNIQUE INDEX RDV2.bk_l_acc_acc ON RDV2.l_account_account (parent_account_rk, child_account_rk);
 
-select * from rdv2.H_TRANSACTION where TRANSACTION_ID = 3201;
-select * from rdv2.S_TRANSACTION where TRANSACTION_RK = '13833976df68c860bdcfc6f9d89fceb8';
 
 SET SERVEROUTPUT ON;
 
+-- Загрузка хаба счетов
+DECLARE
+  v_load_timestamp    DATE := SYSDATE;
+  v_hub_inserted NUMBER(10) := 0;
+  v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба счетов: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  for X in (
+  select LOWER(STANDARD_HASH(t.account_id, 'MD5')) as account_rk,
+    t.account_id,
+    v_load_timestamp load_date,
+    v_src record_source
+  from STG.STG_ACCOUNT t 
+  where not exists 
+  (select 1 from RDV2.H_ACCOUNT rt where rt.account_id = t.account_id))
+  LOOP
+      insert into RDV2.H_ACCOUNT (account_rk, account_id, load_date, record_source)
+      values (x.account_rk, x.account_id, x.load_date, x.record_source);
+      v_hub_inserted := v_hub_inserted + 1;
+      v_records_processed := v_records_processed + 1;
+  END LOOP;
+  
+  COMMIT;
+  
+  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+  DBMS_OUTPUT.PUT_LINE('Статистика:');
+  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб счетов: ' || v_hub_inserted);
+  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+END;
+/
+
+-- Загрузка хаба транзакции
+DECLARE
+  v_load_timestamp    DATE := SYSDATE;
+  v_hub_inserted NUMBER(10) := 0;
+  v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба транзакции: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  for X in (
+  select LOWER(STANDARD_HASH(t.transaction_id, 'MD5')) as transaction_rk,
+    t.TRANSACTION_ID,
+    v_load_timestamp load_date,
+    v_src record_source
+  from STG.STG_TRANSACTION t 
+  where not exists 
+  (select 1 from RDV2.H_TRANSACTION rt where rt.transaction_id = t.transaction_id))
+  LOOP
+      insert into RDV2.H_TRANSACTION (transaction_rk, transaction_id, load_date, record_source)
+      values (x.transaction_rk, x.transaction_id, x.load_date, x.record_source);
+      v_hub_inserted := v_hub_inserted + 1;
+      v_records_processed := v_records_processed + 1;
+  END LOOP;
+  
+  COMMIT;
+  
+  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+  DBMS_OUTPUT.PUT_LINE('Статистика:');
+  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб транзакций: ' || v_hub_inserted);
+  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+END;
+/
+
+-- Загрузка сателлита счета по источнику
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_records_processed NUMBER := 0;
@@ -150,6 +212,7 @@ BEGIN
 END;
 /
 
+-- Загрузка сателлита транзакции (не актуально)
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_records_processed NUMBER := 0;
@@ -204,81 +267,14 @@ BEGIN
 END;
 /
 
-
-
-
-
-
-DECLARE
-  v_load_timestamp    DATE := SYSDATE;
-  v_hub_inserted NUMBER(10) := 0;
-  v_records_processed NUMBER(10) := 0;
-  v_src               VARCHAR2(10) := 'YAST';
-BEGIN
-  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба транзакции: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-  for X in (
-  select LOWER(STANDARD_HASH(t.transaction_id, 'MD5')) as transaction_rk,
-    t.TRANSACTION_ID,
-    v_load_timestamp load_date,
-    v_src record_source
-  from STG.STG_TRANSACTION t 
-  where not exists 
-  (select 1 from RDV2.H_TRANSACTION rt where rt.transaction_id = t.transaction_id))
-  LOOP
-      insert into RDV2.H_TRANSACTION (transaction_rk, transaction_id, load_date, record_source)
-      values (x.transaction_rk, x.transaction_id, x.load_date, x.record_source);
-      v_hub_inserted := v_hub_inserted + 1;
-      v_records_processed := v_records_processed + 1;
-  END LOOP;
-  
-  COMMIT;
-  
-  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-  DBMS_OUTPUT.PUT_LINE('Статистика:');
-  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб транзакций: ' || v_hub_inserted);
-  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-END;
-/
-
-DECLARE
-  v_load_timestamp    DATE := SYSDATE;
-  v_hub_inserted NUMBER(10) := 0;
-  v_records_processed NUMBER(10) := 0;
-  v_src               VARCHAR2(10) := 'YAST';
-BEGIN
-  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба счетов: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-  for X in (
-  select LOWER(STANDARD_HASH(t.account_id, 'MD5')) as account_rk,
-    t.account_id,
-    v_load_timestamp load_date,
-    v_src record_source
-  from STG.STG_ACCOUNT t 
-  where not exists 
-  (select 1 from RDV2.H_ACCOUNT rt where rt.account_id = t.account_id))
-  LOOP
-      insert into RDV2.H_ACCOUNT (account_rk, account_id, load_date, record_source)
-      values (x.account_rk, x.account_id, x.load_date, x.record_source);
-      v_hub_inserted := v_hub_inserted + 1;
-      v_records_processed := v_records_processed + 1;
-  END LOOP;
-  
-  COMMIT;
-  
-  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-  DBMS_OUTPUT.PUT_LINE('Статистика:');
-  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб счетов: ' || v_hub_inserted);
-  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-END;
-/
-
-
+-- Загрузка связей счет-счет для иерархии
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_lnk_updated       NUMBER := 0;
     v_lnk_inserted      NUMBER := 0;
     v_records_processed NUMBER := 0;
 BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало связей счет-счет для иерархии: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+    DBMS_OUTPUT.PUT_LINE('Начало загрузки связей счет-счет для иерархии: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
     -- Вставляем связи "родитель-потомок" на основе структуры account_id
     FOR rec IN (
         select 
@@ -339,5 +335,101 @@ EXCEPTION
 END;
 /
 
-select * from RDV2.H_TRANSACTION where transaction_id = 3401;
-delete from RDV2.H_TRANSACTION where transaction_id > 3390;
+-- Загрузка связи транзакции и счетов, саттелита связи (Не готово)
+DECLARE
+    v_load_timestamp    DATE := SYSDATE;
+    v_sat_updated       NUMBER := 0;
+    v_sat_inserted      NUMBER := 0;
+    v_lnk_inserted      NUMBER := 0;
+    v_records_processed NUMBER := 0;
+    v_src               VARCHAR2(50):='YAST';
+    v_days_ago          NUMBER(10):= 100000;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('Начало загрузки связи транзакции и счетов, саттелита связи: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+    
+    FOR rec IN (
+      SELECT 
+      xta.* ,
+      LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREADACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5')) as hash_diff
+      FROM (
+        SELECT 
+          LOWER(STANDARD_HASH(lta.TRANSACTION_RK || '|' || lta.DEBIT_ACCOUNT_RK || '|' || lta.CREDIT_ACCOUNT_RK , 'MD5')) AS TRANSACTION_DEBACC_CREADACC_RK,
+          lta.* ,
+          v_load_timestamp AS LOAD_DATE ,
+          v_src AS RECORD_SOURCE
+        FROM (
+            SELECT 
+            (SELECT ht.TRANSACTION_RK FROM rdv2.H_TRANSACTION ht WHERE ht.TRANSACTION_ID  = t.TRANSACTION_ID) AS TRANSACTION_RK ,
+            (SELECT had.ACCOUNT_RK FROM rdv2.H_ACCOUNT had WHERE had.ACCOUNT_ID = t.DEBIT_ACCOUNT_ID) AS DEBIT_ACCOUNT_RK ,
+            (SELECT hac.ACCOUNT_RK FROM rdv2.H_ACCOUNT hac WHERE hac.ACCOUNT_ID = t.CREDIT_ACCOUNT_ID) AS CREDIT_ACCOUNT_RK ,
+            t.TRANSACTION_DATE ,
+            t.AMOUNT 
+          FROM  stg.stg_transaction t
+          WHERE RECORD_SOURCE = v_src
+          AND LOAD_DATE > SYSDATE - v_days_ago
+        ) lta
+      ) xta
+      WHERE NOT EXISTS 
+        (SELECT 1 FROM RDV2.L_TRANSATION_ACCOUNT lta WHERE lta.TRANSACTION_DEBACC_CREDACC_RK  = xta.TRANSACTION_DEBACC_CREADACC_RK)
+        OR NOT EXISTS
+        (SELECT 1 FROM RDV2.S_TRANSATION_ACCOUNT sta 
+          WHERE 	
+            sta.HASH_DIFF = LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREADACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5'))
+            AND sta.VALID_FLG = '1'
+        )
+    ) 
+    LOOP
+      BEGIN
+          DECLARE 
+            v_cnt NUMBER(10):=0;
+            v_lta_rk varchar2(64):='';
+          BEGIN
+            -- Смотрим, есть ли запись связи 
+            select count(*) into v_cnt from RDV2.L_TRANSATION_ACCOUNT lta
+            where lta.TRANSACTION_DEBACC_CREADACC_RK = rec.TRANSACTION_DEBACC_CREADACC_RK;
+            IF v_cnt > 0 then -- Если находим линк, то обновляем информацию по нему
+              update RDV2.S_TRANSATION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+              where sta.TRANSACTION_DEBACC_CREADACC_RK = rec.TRANSACTION_DEBACC_CREADACC_RK;
+              v_sat_updated := v_sat_updated + 1;
+            ELSE
+              -- Если линка нет, то находим старый линк по хэшу транзакции
+              BEGIN
+                  select lta.TRANSACTION_DEBACC_CREADACC_RK into v_lta_rk from RDV2.L_TRANSATION_ACCOUNT lta where lta.transaction_rk = rec.TRANSACTION_RK and valid_flg = '1';
+                  update RDV2.S_TRANSATION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                  where sta.TRANSACTION_DEBACC_CREADACC_RK = v_lta_rk;
+                  v_sat_updated := v_sat_updated + 1;
+              EXCEPTION
+                when NO_DATA_FOUND then v_lta_rk :='none';
+              END;
+              insert into RDV2.L_TRANSATION_ACCOUNT
+              (transaction_debacc_credacc_rk, transaction_rk, debit_account_rk, credit_account_rk, load_date, record_source)
+              values (rec.transaction_debacc_credacc_rk, rec.transaction_rk, rec.debit_account_rk, rec.credit_account_rk, rec.load_date, rec.record_source);
+              v_lnk_inserted := v_lnk_inserted + 1;
+            EMD IF;
+            insert into RDV2.S_TRANSATION_ACCOUNT 
+            (transaction_debacc_credacc_rk, valid_from, valid_to, transaction_date, amount, valid_flg, load_date, hash_diff, record_source)
+            values (rec.transaction_debacc_credacc_rk, v_load_timestamp, TO_DATE('2999.12.31','yyyy.mm.dd'), rec.transaction_date, rec.amount, '1', v_load_timestamp, rec.hash_diff, v_src);
+            
+            v_sat_inserted := v_sat_inserted + 1;
+            v_records_processed := v_records_processed + 1;
+
+          END;
+      END;
+    END LOOP;
+    
+    COMMIT;
+    
+    DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+    DBMS_OUTPUT.PUT_LINE('Статистика:');
+    DBMS_OUTPUT.PUT_LINE('  - Вставлено в линк: ' || v_lnk_inserted);
+    DBMS_OUTPUT.PUT_LINE('  - Вставлено в саттелит: ' || v_sat_inserted);
+    DBMS_OUTPUT.PUT_LINE('  - Обновлено в саттелите: ' || v_sat_updated);
+    DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('Ошибка при загрузке иерархии: ' || SQLERRM);
+        RAISE;
+END;
+/
