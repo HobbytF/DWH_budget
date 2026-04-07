@@ -31,7 +31,7 @@ CREATE TABLE RDV2.s_account (
 );
 
 -- СОЗДАНИЕ ЛИНКА ДЛЯ СВЯЗИ ТРАНЗАКЦИИ СО СЧЕТАМИ
-CREATE TABLE RDV2.l_transation_account (
+CREATE TABLE RDV2.l_transaction_account (
     transaction_debacc_credacc_rk   VARCHAR2(64),         -- ХЭШ от связки ключей
     transaction_rk                  VARCHAR2(64),         -- Ссылка на хаб транзакций
     debit_account_rk                VARCHAR2(64),         -- Ссылка на хаб счетов
@@ -42,7 +42,7 @@ CREATE TABLE RDV2.l_transation_account (
 );
 
 -- СОЗДАНИЕ САТТЕЛИТА ДЛЯ СВЯЗИ ТРАНЗАКЦИИ СО СЧЕТОМ
-CREATE TABLE RDV2.s_transation_account (
+CREATE TABLE RDV2.s_transaction_account (
     transaction_debacc_credacc_rk   VARCHAR2(64),         -- Ссылка на линк связи транзакций и счетов
     valid_from                      DATE,                 -- Дата начала действия записи
     valid_to                        DATE,                 -- Дата окончания действия записи
@@ -335,7 +335,7 @@ EXCEPTION
 END;
 /
 
--- Загрузка связи транзакции и счетов, саттелита связи (Не готово)
+-- Загрузка связи транзакции и счетов, саттелита связи (требуется исправить загрузку при отсутствии записи в хабе)
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_sat_updated       NUMBER := 0;
@@ -350,10 +350,10 @@ BEGIN
     FOR rec IN (
       SELECT 
       xta.* ,
-      LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREADACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5')) as hash_diff
+      LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREDACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5')) as hash_diff
       FROM (
         SELECT 
-          LOWER(STANDARD_HASH(lta.TRANSACTION_RK || '|' || lta.DEBIT_ACCOUNT_RK || '|' || lta.CREDIT_ACCOUNT_RK , 'MD5')) AS TRANSACTION_DEBACC_CREADACC_RK,
+          LOWER(STANDARD_HASH(lta.TRANSACTION_RK || '|' || lta.DEBIT_ACCOUNT_RK || '|' || lta.CREDIT_ACCOUNT_RK , 'MD5')) AS TRANSACTION_DEBACC_CREDACC_RK,
           lta.* ,
           v_load_timestamp AS LOAD_DATE ,
           v_src AS RECORD_SOURCE
@@ -370,11 +370,11 @@ BEGIN
         ) lta
       ) xta
       WHERE NOT EXISTS 
-        (SELECT 1 FROM RDV2.L_TRANSATION_ACCOUNT lta WHERE lta.TRANSACTION_DEBACC_CREDACC_RK  = xta.TRANSACTION_DEBACC_CREADACC_RK)
+        (SELECT 1 FROM RDV2.L_TRANSACTION_ACCOUNT lta WHERE lta.TRANSACTION_DEBACC_CREDACC_RK  = xta.TRANSACTION_DEBACC_CREDACC_RK)
         OR NOT EXISTS
-        (SELECT 1 FROM RDV2.S_TRANSATION_ACCOUNT sta 
+        (SELECT 1 FROM RDV2.S_TRANSACTION_ACCOUNT sta 
           WHERE 	
-            sta.HASH_DIFF = LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREADACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5'))
+            sta.HASH_DIFF = LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREDACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5'))
             AND sta.VALID_FLG = '1'
         )
     ) 
@@ -385,28 +385,42 @@ BEGIN
             v_lta_rk varchar2(64):='';
           BEGIN
             -- Смотрим, есть ли запись связи 
-            select count(*) into v_cnt from RDV2.L_TRANSATION_ACCOUNT lta
-            where lta.TRANSACTION_DEBACC_CREADACC_RK = rec.TRANSACTION_DEBACC_CREADACC_RK;
+            select count(*) into v_cnt from RDV2.L_TRANSACTION_ACCOUNT lta
+            where lta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
             IF v_cnt > 0 then -- Если находим линк, то обновляем информацию по нему
-              update RDV2.S_TRANSATION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
-              where sta.TRANSACTION_DEBACC_CREADACC_RK = rec.TRANSACTION_DEBACC_CREADACC_RK;
-              v_sat_updated := v_sat_updated + 1;
+              BEGIN
+                  select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                  join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                  where lta.transaction_rk = rec.TRANSACTION_RK;
+                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                  where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
+                  v_sat_updated := v_sat_updated + 1;
+              EXCEPTION
+                when NO_DATA_FOUND then 
+                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                  where sta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
+                  v_sat_updated := v_sat_updated + 1;
+              END;
+
+
             ELSE
               -- Если линка нет, то находим старый линк по хэшу транзакции
               BEGIN
-                  select lta.TRANSACTION_DEBACC_CREADACC_RK into v_lta_rk from RDV2.L_TRANSATION_ACCOUNT lta where lta.transaction_rk = rec.TRANSACTION_RK and valid_flg = '1';
-                  update RDV2.S_TRANSATION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
-                  where sta.TRANSACTION_DEBACC_CREADACC_RK = v_lta_rk;
+                  select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                  join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                  where lta.transaction_rk = rec.TRANSACTION_RK;
+                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                  where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
                   v_sat_updated := v_sat_updated + 1;
               EXCEPTION
                 when NO_DATA_FOUND then v_lta_rk :='none';
               END;
-              insert into RDV2.L_TRANSATION_ACCOUNT
+              insert into RDV2.L_TRANSACTION_ACCOUNT
               (transaction_debacc_credacc_rk, transaction_rk, debit_account_rk, credit_account_rk, load_date, record_source)
               values (rec.transaction_debacc_credacc_rk, rec.transaction_rk, rec.debit_account_rk, rec.credit_account_rk, rec.load_date, rec.record_source);
               v_lnk_inserted := v_lnk_inserted + 1;
-            EMD IF;
-            insert into RDV2.S_TRANSATION_ACCOUNT 
+            END IF;
+            insert into RDV2.S_TRANSACTION_ACCOUNT 
             (transaction_debacc_credacc_rk, valid_from, valid_to, transaction_date, amount, valid_flg, load_date, hash_diff, record_source)
             values (rec.transaction_debacc_credacc_rk, v_load_timestamp, TO_DATE('2999.12.31','yyyy.mm.dd'), rec.transaction_date, rec.amount, '1', v_load_timestamp, rec.hash_diff, v_src);
             
