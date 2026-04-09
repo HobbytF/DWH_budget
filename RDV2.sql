@@ -77,13 +77,10 @@ CREATE TABLE RDV2.l_account_account (
     parent_child_account_rk   VARCHAR2(64) PRIMARY KEY,
     parent_account_rk         VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (родитель)
     child_account_rk          VARCHAR2(64) NOT NULL, -- Ссылка на хаб H_ACCOUNT (потомок)
-    valid_from                DATE,                  -- Дата начала действия записи
-    valid_to                  DATE,                  -- Дата окончания действия записи
-    valid_flg                 CHAR(1),               -- Флаг валидности
     load_date                 DATE NOT NULL,
     record_source             VARCHAR2(50) NOT NULL
 );
-CREATE UNIQUE INDEX RDV2.bk_l_acc_acc ON RDV2.l_account_account (parent_account_rk, child_account_rk);
+CREATE UNIQUE INDEX RDV2.bk_l_acc_acc ON RDV2.l_account_account (child_account_rk);
 
 
 SET SERVEROUTPUT ON;
@@ -212,62 +209,7 @@ BEGIN
 END;
 /
 
--- Загрузка сателлита транзакции (не актуально)
-DECLARE
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_sat_updated       NUMBER := 0;
-    v_sat_inserted      NUMBER := 0;
-BEGIN
-  DBMS_OUTPUT.PUT_LINE('Начало загрузки сателлита транзакции: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-  FOR X in (
-    select LOWER(STANDARD_HASH(st.TRANSACTION_ID, 'MD5')) as transaction_rk, 
-      v_load_timestamp as valid_from, 
-      TO_DATE('2999.12.31','yyyy.mm.dd') as valid_to,
-      st.TRANSACTION_DATE, 
-      st.AMOUNT,
-      '1' as valid_flg,
-      v_load_timestamp as load_date,
-      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(st.TRANSACTION_ID, 'MD5')) || '|' || st.TRANSACTION_DATE || '|' || st.AMOUNT, 'MD5')) as hash_diff,
-      'STG_TRANSACTION' as record_source
-    from stg.STG_TRANSACTION st 
-    where not EXISTS
-      (select 1 from RDV2.S_TRANSACTION sat where
-      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(st.TRANSACTION_ID, 'MD5')) || '|' || st.TRANSACTION_DATE || '|' || st.AMOUNT, 'MD5')) = sat.HASH_DIFF
-      and sat.valid_flg = '1')
-  )
-  LOOP
-      BEGIN
-          DECLARE 
-            v_cnt NUMBER(10):=0;
-          BEGIN
-            -- Пытаемся найти старую запись
-            select count(*) into v_cnt from RDV2.S_TRANSACTION sat
-            where sat.TRANSACTION_RK = x.transaction_rk and sat.VALID_FLG = '1';
-            -- Если старая запись нашлась, то обновляем ее
-            IF v_cnt > 0 THEN
-              UPDATE RDV2.S_TRANSACTION sat set sat.VALID_FLG = '0', sat.valid_to = v_load_timestamp
-              where sat.TRANSACTION_RK = x.transaction_rk and sat.VALID_FLG = '1';
-              v_sat_updated := v_sat_updated + 1;
-            END IF;
-            -- создаем новую версию
-            insert into rdv2.S_TRANSACTION (transaction_rk, valid_from, valid_to, transaction_date, amount, VALID_FLG, load_date, hash_diff, record_source)
-            values(x.transaction_rk, x.valid_from, x.valid_to, x.transaction_date, x.amount, x.VALID_FLG, x.load_date, x.hash_diff, x.record_source);
-            v_sat_inserted := v_sat_inserted + 1;
-            v_records_processed := v_records_processed + 1;
-          END;
-      END;
-  END LOOP;
-  commit;
-  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-  DBMS_OUTPUT.PUT_LINE('Статистика:');
-  DBMS_OUTPUT.PUT_LINE('  - Обновлено в спутнике: ' || v_sat_updated);
-  DBMS_OUTPUT.PUT_LINE('  - Вставлено в спутнике: ' || v_sat_inserted);
-  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-END;
-/
-
--- Загрузка связей счет-счет для иерархии
+-- Загрузка связей счет-счет для иерархии (убрать валидности)
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_lnk_updated       NUMBER := 0;
@@ -335,13 +277,14 @@ EXCEPTION
 END;
 /
 
--- Загрузка связи транзакции и счетов, саттелита связи (требуется исправить загрузку при отсутствии записи в хабе)
+-- Загрузка связи транзакции и счетов, саттелита связи
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_sat_updated       NUMBER := 0;
     v_sat_inserted      NUMBER := 0;
     v_lnk_inserted      NUMBER := 0;
     v_records_processed NUMBER := 0;
+    v_dummy_detected    BOOLEAN := FALSE;
     v_src               VARCHAR2(50):='YAST';
     v_days_ago          NUMBER(10):= 100000;
 BEGIN
@@ -384,49 +327,51 @@ BEGIN
             v_cnt NUMBER(10):=0;
             v_lta_rk varchar2(64):='';
           BEGIN
-            -- Смотрим, есть ли запись связи 
-            select count(*) into v_cnt from RDV2.L_TRANSACTION_ACCOUNT lta
-            where lta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
-            IF v_cnt > 0 then -- Если находим линк, то обновляем информацию по нему
-              BEGIN
-                  select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
-                  join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
-                  where lta.transaction_rk = rec.TRANSACTION_RK;
-                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
-                  where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
-                  v_sat_updated := v_sat_updated + 1;
-              EXCEPTION
-                when NO_DATA_FOUND then 
-                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
-                  where sta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
-                  v_sat_updated := v_sat_updated + 1;
-              END;
+            IF (rec.TRANSACTION_RK is null or rec.DEBIT_ACCOUNT_RK is null or rec.CREDIT_ACCOUNT_RK is null) THEN -- Если хотя бы один ключ не нашелся в хабе, то не грузим
+              v_dummy_detected := TRUE;
+            ELSE       -- Если все ключи найдены, то грузим
+              -- Смотрим, есть ли запись связи 
+              select count(*) into v_cnt from RDV2.L_TRANSACTION_ACCOUNT lta
+              where lta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
+              IF v_cnt > 0 then -- Если находим линк, то обновляем информацию по нему
+                BEGIN
+                    select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                    join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                    where lta.transaction_rk = rec.TRANSACTION_RK;
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
+                    v_sat_updated := v_sat_updated + 1;
+                EXCEPTION
+                  when NO_DATA_FOUND then 
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
+                    v_sat_updated := v_sat_updated + 1;
+                END;
 
-
-            ELSE
-              -- Если линка нет, то находим старый линк по хэшу транзакции
-              BEGIN
-                  select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
-                  join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
-                  where lta.transaction_rk = rec.TRANSACTION_RK;
-                  update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
-                  where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
-                  v_sat_updated := v_sat_updated + 1;
-              EXCEPTION
-                when NO_DATA_FOUND then v_lta_rk :='none';
-              END;
-              insert into RDV2.L_TRANSACTION_ACCOUNT
-              (transaction_debacc_credacc_rk, transaction_rk, debit_account_rk, credit_account_rk, load_date, record_source)
-              values (rec.transaction_debacc_credacc_rk, rec.transaction_rk, rec.debit_account_rk, rec.credit_account_rk, rec.load_date, rec.record_source);
-              v_lnk_inserted := v_lnk_inserted + 1;
+              ELSE
+                -- Если линка нет, то находим старый линк по хэшу транзакции
+                BEGIN
+                    select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                    join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                    where lta.transaction_rk = rec.TRANSACTION_RK;
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
+                    v_sat_updated := v_sat_updated + 1;
+                EXCEPTION
+                  when NO_DATA_FOUND then v_lta_rk :='none';
+                END;
+                insert into RDV2.L_TRANSACTION_ACCOUNT
+                (transaction_debacc_credacc_rk, transaction_rk, debit_account_rk, credit_account_rk, load_date, record_source)
+                values (rec.transaction_debacc_credacc_rk, rec.transaction_rk, rec.debit_account_rk, rec.credit_account_rk, rec.load_date, rec.record_source);
+                v_lnk_inserted := v_lnk_inserted + 1;
+              END IF;
+              insert into RDV2.S_TRANSACTION_ACCOUNT 
+              (transaction_debacc_credacc_rk, valid_from, valid_to, transaction_date, amount, valid_flg, load_date, hash_diff, record_source)
+              values (rec.transaction_debacc_credacc_rk, v_load_timestamp, TO_DATE('2999.12.31','yyyy.mm.dd'), rec.transaction_date, rec.amount, '1', v_load_timestamp, rec.hash_diff, v_src);
+              
+              v_sat_inserted := v_sat_inserted + 1;
+              v_records_processed := v_records_processed + 1;
             END IF;
-            insert into RDV2.S_TRANSACTION_ACCOUNT 
-            (transaction_debacc_credacc_rk, valid_from, valid_to, transaction_date, amount, valid_flg, load_date, hash_diff, record_source)
-            values (rec.transaction_debacc_credacc_rk, v_load_timestamp, TO_DATE('2999.12.31','yyyy.mm.dd'), rec.transaction_date, rec.amount, '1', v_load_timestamp, rec.hash_diff, v_src);
-            
-            v_sat_inserted := v_sat_inserted + 1;
-            v_records_processed := v_records_processed + 1;
-
           END;
       END;
     END LOOP;
@@ -435,6 +380,7 @@ BEGIN
     
     DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
     DBMS_OUTPUT.PUT_LINE('Статистика:');
+    IF v_dummy_detected then DBMS_OUTPUT.PUT_LINE('Обнаружены dummy-записи. Требуется прогрузка хабов'); END IF;
     DBMS_OUTPUT.PUT_LINE('  - Вставлено в линк: ' || v_lnk_inserted);
     DBMS_OUTPUT.PUT_LINE('  - Вставлено в саттелит: ' || v_sat_inserted);
     DBMS_OUTPUT.PUT_LINE('  - Обновлено в саттелите: ' || v_sat_updated);
