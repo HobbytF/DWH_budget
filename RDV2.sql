@@ -209,53 +209,53 @@ BEGIN
 END;
 /
 
--- Загрузка связей счет-счет для иерархии (убрать валидности)
+-- Загрузка связей счет-счет для иерархии (SCD0)
 DECLARE
     v_load_timestamp    DATE := SYSDATE;
     v_lnk_updated       NUMBER := 0;
     v_lnk_inserted      NUMBER := 0;
     v_records_processed NUMBER := 0;
+    v_src               VARCHAR2(50):='YAST';
 BEGIN
     DBMS_OUTPUT.PUT_LINE('Начало загрузки связей счет-счет для иерархии: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
     -- Вставляем связи "родитель-потомок" на основе структуры account_id
     FOR rec IN (
-        select 
-            LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5')) as parent_child_account_rk,
-            SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) parent_account_id, 
-            account_id child_account_id,
-            LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) as parent_account_rk,
-            LOWER(STANDARD_HASH(account_id, 'MD5')) as child_account_rk,
-            v_load_timestamp as valid_from,
-            TO_DATE('2999.12.31','yyyy.mm.dd') as valid_to,
-            '1' as valid_flg,
-            v_load_timestamp as load_date,
-            'YAST' as record_source
-        from stg.stg_account
-        where SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) is not null
-        and not EXISTS (
-          select 1 from rdv2.l_account_account laa 
-          WHERE laa.parent_child_account_rk = LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5'))
-          AND laa.valid_flg = '1'
-        )
+      select 
+          LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5')) as parent_child_account_rk,
+          LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) as parent_account_rk,
+          LOWER(STANDARD_HASH(account_id, 'MD5')) as child_account_rk,
+          v_load_timestamp as load_date,
+          v_src as record_source
+      from stg.stg_account
+      where SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) is not null
+      and not EXISTS (
+        select 1 from rdv2.l_account_account laa 
+        WHERE laa.parent_child_account_rk = LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5'))
+      )
     ) 
     LOOP
       BEGIN
           DECLARE 
             v_cnt NUMBER(10):=0;
           BEGIN
-            -- Пытаемся найти старую запись
+            -- Пытаемся найти неактуальную запись
             select count(*) into v_cnt from RDV2.L_ACCOUNT_ACCOUNT laa
-            where laa.parent_child_account_rk = rec.parent_child_account_rk and laa.VALID_FLG = '1';
-            -- Если старая запись нашлась, то обновляем ее
+            where laa.child_account_rk = rec.child_account_rk;
+            -- Если такая запись нашлась, то обновляем ее
             IF v_cnt > 0 THEN
-              UPDATE RDV2.L_ACCOUNT_ACCOUNT laa set laa.VALID_FLG = '0', laa.valid_to = v_load_timestamp
-              where laa.parent_child_account_rk = rec.parent_child_account_rk and laa.VALID_FLG = '1';
-              v_lnk_updated := v_lnk_updated + 1;
+              begin
+                UPDATE RDV2.L_ACCOUNT_ACCOUNT laa set laa.load_date = v_load_timestamp, laa.parent_child_account_rk = rec.parent_child_account_rk, laa.parent_account_rk = rec.parent_account_rk
+                where laa.child_account_rk = rec.child_account_rk;
+                v_lnk_updated := v_lnk_updated + 1;
+              end;
+            ELSE
+              begin
+                -- создаем новую версию
+                insert into rdv2.L_ACCOUNT_ACCOUNT (parent_child_account_rk, parent_account_rk, child_account_rk, load_date, record_source)
+                values(rec.parent_child_account_rk, rec.parent_account_rk, rec.child_account_rk, rec.load_date, rec.record_source);
+                v_lnk_inserted := v_lnk_inserted + 1;
+              end;
             END IF;
-            -- создаем новую версию
-            insert into rdv2.L_ACCOUNT_ACCOUNT (parent_child_account_rk, parent_account_rk, child_account_rk, valid_from, valid_to, valid_flg, load_date, record_source)
-            values(rec.parent_child_account_rk, rec.parent_account_rk, rec.child_account_rk, rec.valid_from, rec.valid_to, rec.valid_flg, rec.load_date, rec.record_source);
-            v_lnk_inserted := v_lnk_inserted + 1;
             v_records_processed := v_records_processed + 1;
           END;
       END;
