@@ -9,890 +9,317 @@ CREATE TABLE FLOW.load_error_log (
     record_data     CLOB
 );
 
-
-create or replace PROCEDURE      flow.load_account_from_stg_to_rdv
+-- Загрузка хаба счетов
+CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_hub_account 
 IS
-    -- Переменные для логирования и обработки ошибок
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_hub_inserted      NUMBER := 0;
-    v_sat_updated       NUMBER := 0;
-    v_sat_inserted      NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    -- Курсор для получения данных из STG
-    CURSOR c_account_data IS
-        SELECT 
-            st.account_id,
-            LOWER(STANDARD_HASH(st.account_id, 'MD5')) as hsh,
-            st.account_name,
-            st.start_balance,
-            st.hash_diff,
-            st.record_source
-        FROM stg.stg_account st;
-
+  v_load_timestamp    DATE := SYSDATE;
+  v_hub_inserted NUMBER(10) := 0;
+  v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
 BEGIN
-    -- Логирование начала загрузки
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки счетов из STG в RDV: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    -- Блок обработки данных с обработкой исключений
-    BEGIN
-        FOR rec IN c_account_data LOOP
-            BEGIN
-                -- Шаг 1: Вычисляем хэш-ключ для хаба
-                DECLARE
-                    v_account_hash_key VARCHAR2(64);
-                BEGIN
-                    v_account_hash_key := rec.hsh;
-                    
-                    -- Шаг 2: Загрузка в хаб H_ACCOUNT (если записи нет)
-                    INSERT INTO rdv.h_account (
-                        account_hash_key,
-                        account_id,
-                        load_date,
-                        record_source
-                    )
-                    VALUES (
-                        v_account_hash_key,
-                        rec.account_id,
-                        v_load_timestamp,
-                        rec.record_source
-                    );
-                    
-                    v_hub_inserted := v_hub_inserted + 1;
-                    
-                EXCEPTION
-                    WHEN DUP_VAL_ON_INDEX THEN
-                        -- Запись уже существует в хабе - это нормально
-                        NULL;
-                    WHEN OTHERS THEN
-                        RAISE;
-                END;
-                
-                -- Шаг 3: Загрузка в спутник S_ACCOUNT по SCD Type 2
-                DECLARE
-                    v_account_hash_key VARCHAR2(64);
-                    v_current_hash_diff VARCHAR2(64);
-                    v_current_load_date DATE;
-                BEGIN
-                    -- Получаем хэш-ключ
-                    v_account_hash_key := rec.hsh;
-                    
-                    -- Проверяем текущую актуальную версию в спутнике
-                    BEGIN
-                        SELECT hash_diff, load_date
-                        INTO v_current_hash_diff, v_current_load_date
-                        FROM rdv.s_account
-                        WHERE account_hash_key = v_account_hash_key
-                          AND load_end_date IS NULL;  -- Актуальная запись
-                          
-                        -- Если хэш изменился, нужно создать новую версию
-                        IF v_current_hash_diff != rec.hash_diff THEN
-                            -- Закрываем текущую актуальную версию
-                            UPDATE rdv.s_account 
-                            SET load_end_date = v_load_timestamp
-                            WHERE account_hash_key = v_account_hash_key
-                              AND load_end_date IS NULL;
-                              
-                            v_sat_updated := v_sat_updated + 1;
-                            
-                            -- Создаем новую версию
-                            INSERT INTO rdv.s_account (
-                                account_hash_key,
-                                load_date,
-                                hash_diff,
-                                load_end_date,
-                                account_name,
-                                start_balance,
-                                record_source
-                            )
-                            VALUES (
-                                v_account_hash_key,
-                                v_load_timestamp,
-                                rec.hash_diff,
-                                NULL,  -- Новая актуальная версия
-                                rec.account_name,
-                                rec.start_balance,
-                                rec.record_source
-                            );
-                            
-                            v_sat_inserted := v_sat_inserted + 1;
-                            v_records_processed := v_records_processed + 1;
-                        END IF;
-                        
-                    EXCEPTION
-                        WHEN NO_DATA_FOUND THEN
-                            -- Актуальной записи нет - вставляем первую версию
-                            INSERT INTO rdv.s_account (
-                                account_hash_key,
-                                load_date,
-                                hash_diff,
-                                load_end_date,
-                                account_name,
-                                start_balance,
-                                record_source
-                            )
-                            VALUES (
-                                v_account_hash_key,
-                                v_load_timestamp,
-                                rec.hash_diff,
-                                NULL,  -- Первая актуальная версия
-                                rec.account_name,
-                                rec.start_balance,
-                                rec.record_source
-                            );
-                            
-                            v_sat_inserted := v_sat_inserted + 1;
-                            v_records_processed := v_records_processed + 1;
-                        WHEN TOO_MANY_ROWS THEN
-                            -- Несколько актуальных записей - ошибка в данных
-                            v_error_message := 'Найдено несколько актуальных версий для account_id=' || rec.account_id;
-                            DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                            -- Записываем в лог ошибок
-                            INSERT INTO flow.load_error_log (
-                                procedure_name,
-                                error_message, 
-                                account_id,
-                                record_data
-                            ) VALUES (
-                                'LOAD_ACCOUNT_FROM_STG_TO_RDV',
-                                v_error_message,
-                                rec.account_id,
-                                'account_name=' || rec.account_name || ', start_balance=' || rec.start_balance
-                            );
-                    END;
-                    
-                END; -- Конец внутреннего блока DECLARE
-                
-                -- Логирование прогресса
-               -- IF MOD(v_records_processed, 1000) = 0 THEN
-               --     DBMS_OUTPUT.PUT_LINE('Обработано записей: ' || v_records_processed);
-               -- END IF;
-                
-            EXCEPTION
-                WHEN OTHERS THEN
-                    -- Логируем ошибку и продолжаем обработку
-                    v_error_message := 'Ошибка при обработке account_id=' || rec.account_id || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    -- Записываем в лог ошибок
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        account_id, 
-                        record_data
-                    ) VALUES (
-                        'LOAD_ACCOUNT_FROM_STG_TO_RDV',
-                        v_error_message,
-                        rec.account_id,
-                        'account_name=' || rec.account_name || ', start_balance=' || rec.start_balance
-                    );
-                    
-                    CONTINUE; -- Продолжаем обработку следующих записей
-            END;
-        END LOOP;
-        
-        COMMIT; -- Фиксируем все изменения
-        
-        -- Логирование успешного завершения
-        DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Статистика:');
-        DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб: ' || v_hub_inserted);
-        DBMS_OUTPUT.PUT_LINE('  - Обновлено в спутнике: ' || v_sat_updated);
-        DBMS_OUTPUT.PUT_LINE('  - Вставлено в спутнике: ' || v_sat_inserted);
-        DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK; -- Откатываем изменения при ошибке
-            v_error_message := 'Критическая ошибка при загрузке: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE; -- Пробрасываем исключение дальше
-    END;
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба счетов: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  for X in (
+  select LOWER(STANDARD_HASH(t.account_id, 'MD5')) as account_rk,
+    t.account_id,
+    v_load_timestamp load_date,
+    v_src record_source
+  from STG.STG_ACCOUNT t 
+  where not exists 
+  (select 1 from RDV2.H_ACCOUNT rt where rt.account_id = t.account_id))
+  LOOP
+      insert into RDV2.H_ACCOUNT (account_rk, account_id, load_date, record_source)
+      values (x.account_rk, x.account_id, x.load_date, x.record_source);
+      v_hub_inserted := v_hub_inserted + 1;
+      v_records_processed := v_records_processed + 1;
+  END LOOP;
   
-END load_account_from_stg_to_rdv;
+  COMMIT;
+  
+  DBMS_OUTPUT.PUT_LINE('Загрузка хаба счетов завершена успешно.');
+  DBMS_OUTPUT.PUT_LINE('Статистика:');
+  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб счетов: ' || v_hub_inserted);
+  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+END wrk_stg_rdv_hub_account;
 /
 
-CREATE OR REPLACE PROCEDURE flow.load_account_hierarchy
+-- Загрузка хаба транзакции
+CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_hub_transaction
 IS
-    v_load_timestamp DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
+  v_load_timestamp    DATE := SYSDATE;
+  v_hub_inserted NUMBER(10) := 0;
+  v_records_processed NUMBER(10) := 0;
+  v_src               VARCHAR2(10) := 'YAST';
 BEGIN
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки хаба транзакции: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  for X in (
+  select LOWER(STANDARD_HASH(t.transaction_id, 'MD5')) as transaction_rk,
+    t.TRANSACTION_ID,
+    v_load_timestamp load_date,
+    v_src record_source
+  from STG.STG_TRANSACTION t 
+  where not exists 
+  (select 1 from RDV2.H_TRANSACTION rt where rt.transaction_id = t.transaction_id))
+  LOOP
+      insert into RDV2.H_TRANSACTION (transaction_rk, transaction_id, load_date, record_source)
+      values (x.transaction_rk, x.transaction_id, x.load_date, x.record_source);
+      v_hub_inserted := v_hub_inserted + 1;
+      v_records_processed := v_records_processed + 1;
+  END LOOP;
+  
+  COMMIT;
+  
+  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+  DBMS_OUTPUT.PUT_LINE('Статистика:');
+  DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб транзакций: ' || v_hub_inserted);
+  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+END wrk_stg_rdv_hub_transaction;
+/
+
+-- Загрузка сателлита счета по источнику
+CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_sat_account (v_src in varchar2, v_days_ago in number)
+IS
+    v_load_timestamp    DATE := SYSDATE;
+    v_records_processed NUMBER := 0;
+    v_sat_updated       NUMBER := 0;
+    v_sat_inserted      NUMBER := 0;
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('Начало загрузки сателлита счета по источнику ' || v_src || ': ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+  FOR X in (
+    select LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) as account_rk, 
+      v_load_timestamp as valid_from, 
+      TO_DATE('2999.12.31','yyyy.mm.dd') as valid_to,
+      sa.ACCOUNT_NAME, 
+      sa.START_BALANCE,
+      '1' as valid_flg,
+      v_load_timestamp as load_date,
+      LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99'), 'MD5')) as hash_diff,
+      v_src as record_source
+    from stg.STG_ACCOUNT sa 
+    where not EXISTS
+      (select 1 from RDV2.S_ACCOUNT sat where
+        LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(sa.ACCOUNT_ID, 'MD5')) || '|' || sa.ACCOUNT_NAME || '|' || to_char(sa.START_BALANCE, '999999999.99'), 'MD5')) = sat.HASH_DIFF
+        and sat.valid_flg = '1'  and sat.RECORD_SOURCE = v_src
+      )
+      and sa.RECORD_SOURCE = v_src
+      and sa.LOAD_DATE > TRUNC(sysdate) - v_days_ago
+  )
+  LOOP
+      BEGIN
+          DECLARE 
+            v_cnt NUMBER(10):=0;
+          BEGIN
+            -- Пытаемся найти старую запись
+            select count(*) into v_cnt from RDV2.S_ACCOUNT sat
+            where sat.account_rk = x.account_rk and sat.VALID_FLG = '1' and sat.record_source = x.record_source;
+            -- Если старая запись нашлась, то обновляем ее
+            IF v_cnt > 0 THEN
+              UPDATE RDV2.S_ACCOUNT sat set sat.VALID_FLG = '0', sat.valid_to = v_load_timestamp
+              where sat.account_rk = x.account_rk and sat.VALID_FLG = '1' and sat.record_source = x.record_source;
+              v_sat_updated := v_sat_updated + 1;
+            END IF;
+            -- создаем новую версию
+            insert into rdv2.S_ACCOUNT (account_rk, valid_from, valid_to, account_name, start_balance, VALID_FLG, load_date, hash_diff, record_source)
+            values(x.account_rk, x.valid_from, x.valid_to, x.account_name, x.start_balance, x.VALID_FLG, x.load_date, x.hash_diff, x.record_source);
+            v_sat_inserted := v_sat_inserted + 1;
+            v_records_processed := v_records_processed + 1;
+          END;
+      END;
+  END LOOP;
+  commit;
+  DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+  DBMS_OUTPUT.PUT_LINE('Статистика:');
+  DBMS_OUTPUT.PUT_LINE('  - Обновлено в спутнике: ' || v_sat_updated);
+  DBMS_OUTPUT.PUT_LINE('  - Вставлено в спутнике: ' || v_sat_inserted);
+  DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+END wrk_stg_rdv_sat_account;
+/
+
+-- Загрузка связей счет-счет для иерархии (SCD0)
+CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_lnk_account_account
+IS
+    v_load_timestamp    DATE := SYSDATE;
+    v_lnk_updated       NUMBER := 0;
+    v_lnk_inserted      NUMBER := 0;
+    v_records_processed NUMBER := 0;
+    v_src               VARCHAR2(50):='YAST';
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('Начало загрузки связей счет-счет для иерархии: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
     -- Вставляем связи "родитель-потомок" на основе структуры account_id
     FOR rec IN (
-        select SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) parent_account_id, account_id child_account_id,
-              LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) as parent_hash_key,
-              LOWER(STANDARD_HASH(account_id, 'MD5')) as child_hash_key
-        from stg.stg_account
-        where SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) is not null
-    ) LOOP
-        BEGIN
-            INSERT INTO rdv.l_account_account (
-                account_parent_child_hash_key,
-                parent_account_hash_key,
-                child_account_hash_key,
-                load_date,
-                record_source
-            )
-            VALUES (
-                LOWER(STANDARD_HASH(rec.parent_hash_key || '|' || rec.child_hash_key, 'MD5')),
-                rec.parent_hash_key,
-                rec.child_hash_key,
-                v_load_timestamp,
-                'SRC.ACCOUNT'
-            );
-            
+      select 
+          LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5')) as parent_child_account_rk,
+          LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) as parent_account_rk,
+          LOWER(STANDARD_HASH(account_id, 'MD5')) as child_account_rk,
+          v_load_timestamp as load_date,
+          v_src as record_source
+      from stg.stg_account
+      where SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)) is not null
+      and not EXISTS (
+        select 1 from rdv2.l_account_account laa 
+        WHERE laa.parent_child_account_rk = LOWER(STANDARD_HASH(LOWER(STANDARD_HASH(SUBSTR(account_id, 1, INSTR(account_id,'.', -1, 2)), 'MD5')) || '|' || LOWER(STANDARD_HASH(account_id, 'MD5')), 'MD5'))
+      )
+    ) 
+    LOOP
+      BEGIN
+          DECLARE 
+            v_cnt NUMBER(10):=0;
+          BEGIN
+            -- Пытаемся найти неактуальную запись
+            select count(*) into v_cnt from RDV2.L_ACCOUNT_ACCOUNT laa
+            where laa.child_account_rk = rec.child_account_rk;
+            -- Если такая запись нашлась, то обновляем ее
+            IF v_cnt > 0 THEN
+              begin
+                UPDATE RDV2.L_ACCOUNT_ACCOUNT laa set laa.load_date = v_load_timestamp, laa.parent_child_account_rk = rec.parent_child_account_rk, laa.parent_account_rk = rec.parent_account_rk
+                where laa.child_account_rk = rec.child_account_rk;
+                v_lnk_updated := v_lnk_updated + 1;
+              end;
+            ELSE
+              begin
+                -- создаем новую версию
+                insert into rdv2.L_ACCOUNT_ACCOUNT (parent_child_account_rk, parent_account_rk, child_account_rk, load_date, record_source)
+                values(rec.parent_child_account_rk, rec.parent_account_rk, rec.child_account_rk, rec.load_date, rec.record_source);
+                v_lnk_inserted := v_lnk_inserted + 1;
+              end;
+            END IF;
             v_records_processed := v_records_processed + 1;
-            
-        EXCEPTION
-            WHEN DUP_VAL_ON_INDEX THEN
-                NULL; -- Связь уже существует
-        END;
+          END;
+      END;
     END LOOP;
     
     COMMIT;
     
-    DBMS_OUTPUT.PUT_LINE('Загружено иерархических связей: ' || v_records_processed);
+    DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+    DBMS_OUTPUT.PUT_LINE('Статистика:');
+    DBMS_OUTPUT.PUT_LINE('  - Обновлено в линке иерархии: ' || v_lnk_updated);
+    DBMS_OUTPUT.PUT_LINE('  - Вставлено в линк иерархии: ' || v_lnk_inserted);
+    DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
     
 EXCEPTION
     WHEN OTHERS THEN
         ROLLBACK;
         DBMS_OUTPUT.PUT_LINE('Ошибка при загрузке иерархии: ' || SQLERRM);
         RAISE;
-END load_account_hierarchy;
+END;
 /
 
-CREATE OR REPLACE PROCEDURE flow.load_transaction_from_stg_to_rdv
+-- Загрузка связи транзакции и счетов, саттелита связи
+CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_lnk_transaction_account (v_src in varchar2, v_days_ago in number)
 IS
     v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_hub_inserted      NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    CURSOR c_transaction_data IS
-        SELECT 
-            st.transaction_id,
-            LOWER(STANDARD_HASH(st.transaction_id, 'MD5')) as transaction_hash_key,
-            st.record_source
-        FROM stg.stg_transaction st
-        WHERE st.load_date >= TRUNC(SYSDATE-5) -- Загрузка за последние 30 дней
-           OR NOT EXISTS (
-                SELECT 1 FROM rdv.h_transaction ht 
-                WHERE ht.transaction_id = st.transaction_id
-           );
-
-BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки транзакций из STG в RDV: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    BEGIN
-        FOR rec IN c_transaction_data LOOP
-            BEGIN
-                -- Вставка в хаб H_TRANSACTION
-                INSERT INTO rdv.h_transaction (
-                    transaction_hash_key,
-                    transaction_id,
-                    load_date,
-                    record_source
-                )
-                VALUES (
-                    rec.transaction_hash_key,
-                    rec.transaction_id,
-                    v_load_timestamp,
-                    rec.record_source
-                );
-                
-                v_hub_inserted := v_hub_inserted + 1;
-                v_records_processed := v_records_processed + 1;
-                
-            EXCEPTION
-                WHEN DUP_VAL_ON_INDEX THEN
-                    -- Запись уже существует - это нормально
-                    NULL;
-                WHEN OTHERS THEN
-                    v_error_message := 'Ошибка при обработке transaction_id=' || rec.transaction_id || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        transaction_id,
-                        record_data
-                    ) VALUES (
-                        'LOAD_TRANSACTION_FROM_STG_TO_RDV',
-                        v_error_message,
-                        rec.transaction_id,
-                        'transaction_id=' || rec.transaction_id
-                    );
-            END;
-            
-            -- Логирование прогресса
---            IF MOD(v_records_processed, 1000) = 0 THEN
---                DBMS_OUTPUT.PUT_LINE('Обработано записей: ' || v_records_processed);
---            END IF;
-        END LOOP;
-        
-        COMMIT;
-        
-        DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Статистика:');
-        DBMS_OUTPUT.PUT_LINE('  - Вставлено в хаб транзакций: ' || v_hub_inserted);
-        DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            v_error_message := 'Критическая ошибка при загрузке транзакций: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE;
-    END;
-    
-END load_transaction_from_stg_to_rdv;
-/
-
-CREATE OR REPLACE PROCEDURE flow.load_account_transaction_link
-IS
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_link_inserted     NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    CURSOR c_transaction_data IS
-        SELECT 
-            st.transaction_id,
-            st.debit_account_id,
-            st.credit_account_id,
-            LOWER(STANDARD_HASH(st.transaction_id, 'MD5')) as transaction_hash_key,
-            LOWER(STANDARD_HASH(st.debit_account_id, 'MD5')) as debit_account_hash_key,
-            LOWER(STANDARD_HASH(st.credit_account_id, 'MD5')) as credit_account_hash_key,
-            LOWER(STANDARD_HASH(st.debit_account_id || '|' || st.credit_account_id || '|' || st.transaction_id, 'MD5')) as account_txn_hash_key,
-            st.record_source
-        FROM stg.stg_transaction st
-        WHERE EXISTS (
-            SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.debit_account_id
-        )
-        AND EXISTS (
-            SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.credit_account_id
-        );
-
-BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки связей счет-транзакция: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    BEGIN
-        FOR rec IN c_transaction_data LOOP
-            BEGIN
-                -- Вставка в связь L_ACCOUNT_TRANSACTION
-                INSERT INTO rdv.l_account_transaction (
-                    account_txn_hash_key,
-                    debit_account_hash_key,
-                    credit_account_hash_key,
-                    transaction_hash_key,
-                    load_date,
-                    record_source
-                )
-                VALUES (
-                    rec.account_txn_hash_key,
-                    rec.debit_account_hash_key,
-                    rec.credit_account_hash_key,
-                    rec.transaction_hash_key,
-                    v_load_timestamp,
-                    rec.record_source
-                );
-                
-                v_link_inserted := v_link_inserted + 1;
-                v_records_processed := v_records_processed + 1;
-                
-            EXCEPTION
-                WHEN DUP_VAL_ON_INDEX THEN
-                    -- Связь уже существует - это нормально
-                    NULL;
-                WHEN OTHERS THEN
-                    v_error_message := 'Ошибка при обработке transaction_id=' || rec.transaction_id 
-                                     || ', debit=' || rec.debit_account_id 
-                                     || ', credit=' || rec.credit_account_id 
-                                     || ', trans_hash=' || rec.transaction_hash_key 
-                                     || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        transaction_id,
-                        record_data
-                    ) VALUES (
-                        'LOAD_ACCOUNT_TRANSACTION_LINK',
-                        v_error_message,
-                        rec.transaction_id,
-                        'debit_account_id=' || rec.debit_account_id 
-                        || ', credit_account_id=' || rec.credit_account_id
-                        || ', transaction_id=' || rec.transaction_id
-                    );
-            END;
-            
-            -- Логирование прогресса
-            --IF MOD(v_records_processed, 1000) = 0 THEN
-            --   DBMS_OUTPUT.PUT_LINE('Обработано записей: ' || v_records_processed);
-            --END IF;
-        END LOOP;
-        
-        COMMIT;
-        
-        DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Статистика:');
-        DBMS_OUTPUT.PUT_LINE('  - Вставлено связей: ' || v_link_inserted);
-        DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-        
-        -- Логирование транзакций, которые не были загружены из-за отсутствия счетов
-        DECLARE
-            v_missing_records NUMBER;
-        BEGIN
-            SELECT COUNT(*)
-            INTO v_missing_records
-            FROM stg.stg_transaction st
-            WHERE NOT EXISTS (
-                SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.debit_account_id
-            )
-            OR NOT EXISTS (
-                SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.credit_account_id
-            );
-            
-            IF v_missing_records > 0 THEN
-                DBMS_OUTPUT.PUT_LINE('Внимание: ' || v_missing_records || ' транзакций не загружены из-за отсутствующих счетов.');
-                
-                -- Логируем эти записи
-                INSERT INTO flow.load_error_log (
-                    procedure_name,
-                    error_message,
-                    transaction_id,
-                    record_data
-                )
-                SELECT 
-                    'LOAD_ACCOUNT_TRANSACTION_LINK',
-                    'Отсутствуют связанные счета',
-                    st.transaction_id,
-                    'debit_account_id=' || st.debit_account_id 
-                    || ', credit_account_id=' || st.credit_account_id
-                    || ', transaction_id=' || st.transaction_id
-                FROM stg.stg_transaction st
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.debit_account_id
-                )
-                OR NOT EXISTS (
-                    SELECT 1 FROM rdv.h_account ha WHERE ha.account_id = st.credit_account_id
-                );
-                
-                COMMIT;
-            END IF;
-        END;
-        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            v_error_message := 'Критическая ошибка при загрузке связей: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE;
-    END;
-    
-END load_account_transaction_link;
-/
-
-CREATE OR REPLACE PROCEDURE flow.load_account_transaction_satellite
-IS
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
     v_sat_updated       NUMBER := 0;
     v_sat_inserted      NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    CURSOR c_transaction_data IS
-        SELECT 
-            st.transaction_id,
-            st.transaction_date,
-            st.amount,
-            st.hash_diff,
-            st.record_source,
-            lat.account_txn_hash_key
-        FROM stg.stg_transaction st
-        JOIN rdv.l_account_transaction lat ON 
-            lat.debit_account_hash_key = LOWER(STANDARD_HASH(st.debit_account_id, 'MD5'))
-            AND lat.credit_account_hash_key = LOWER(STANDARD_HASH(st.credit_account_id, 'MD5'))
-            AND lat.transaction_hash_key = LOWER(STANDARD_HASH(st.transaction_id, 'MD5'));
-
+    v_lnk_inserted      NUMBER := 0;
+    v_records_processed NUMBER := 0;
+    v_dummy_detected    BOOLEAN := FALSE;
 BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки сателлита связей счет-транзакция: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    BEGIN
-        FOR rec IN c_transaction_data LOOP
-            BEGIN
-                -- Проверяем текущую актуальную версию в спутнике
-                DECLARE
-                    v_current_hash_diff VARCHAR2(64);
-                    v_current_load_date DATE;
+    DBMS_OUTPUT.PUT_LINE('Начало загрузки связи транзакции и счетов, саттелита связи  по источнику ' || v_src || ': ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
+    
+    FOR rec IN (
+      SELECT 
+      xta.* ,
+      LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREDACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5')) as hash_diff
+      FROM (
+        SELECT 
+          LOWER(STANDARD_HASH(lta.TRANSACTION_RK || '|' || lta.DEBIT_ACCOUNT_RK || '|' || lta.CREDIT_ACCOUNT_RK , 'MD5')) AS TRANSACTION_DEBACC_CREDACC_RK,
+          lta.* ,
+          v_load_timestamp AS LOAD_DATE ,
+          v_src AS RECORD_SOURCE
+        FROM (
+            SELECT 
+            (SELECT ht.TRANSACTION_RK FROM rdv2.H_TRANSACTION ht WHERE ht.TRANSACTION_ID  = t.TRANSACTION_ID) AS TRANSACTION_RK ,
+            (SELECT had.ACCOUNT_RK FROM rdv2.H_ACCOUNT had WHERE had.ACCOUNT_ID = t.DEBIT_ACCOUNT_ID) AS DEBIT_ACCOUNT_RK ,
+            (SELECT hac.ACCOUNT_RK FROM rdv2.H_ACCOUNT hac WHERE hac.ACCOUNT_ID = t.CREDIT_ACCOUNT_ID) AS CREDIT_ACCOUNT_RK ,
+            t.TRANSACTION_DATE ,
+            t.AMOUNT 
+          FROM  stg.stg_transaction t
+          WHERE RECORD_SOURCE = v_src
+          AND LOAD_DATE > SYSDATE - v_days_ago
+        ) lta
+      ) xta
+      WHERE NOT EXISTS 
+        (SELECT 1 FROM RDV2.L_TRANSACTION_ACCOUNT lta WHERE lta.TRANSACTION_DEBACC_CREDACC_RK  = xta.TRANSACTION_DEBACC_CREDACC_RK)
+        OR NOT EXISTS
+        (SELECT 1 FROM RDV2.S_TRANSACTION_ACCOUNT sta 
+          WHERE 	
+            sta.HASH_DIFF = LOWER(STANDARD_HASH(xta.TRANSACTION_DEBACC_CREDACC_RK || '|' || to_char(xta.TRANSACTION_DATE, 'dd.mm.yyyy HH24:mi:ss') || '|' || to_char(xta.AMOUNT, '999999999.99'), 'MD5'))
+            AND sta.VALID_FLG = '1'
+        )
+    ) 
+    LOOP
+      BEGIN
+          DECLARE 
+            v_cnt NUMBER(10):=0;
+            v_lta_rk varchar2(64):='';
+          BEGIN
+            IF (rec.TRANSACTION_RK is null or rec.DEBIT_ACCOUNT_RK is null or rec.CREDIT_ACCOUNT_RK is null) THEN -- Если хотя бы один ключ не нашелся в хабе, то не грузим
+              v_dummy_detected := TRUE;
+            ELSE       -- Если все ключи найдены, то грузим
+              -- Смотрим, есть ли запись связи 
+              select count(*) into v_cnt from RDV2.L_TRANSACTION_ACCOUNT lta
+              where lta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
+              IF v_cnt > 0 then -- Если находим линк, то обновляем информацию по нему
                 BEGIN
-                    -- Пытаемся найти актуальную запись
-                    BEGIN
-                        SELECT hash_diff, load_date
-                        INTO v_current_hash_diff, v_current_load_date
-                        FROM rdv.s_account_transaction
-                        WHERE account_txn_hash_key = rec.account_txn_hash_key
-                          AND load_end_date IS NULL;  -- Актуальная запись
-                          
-                        -- Если хэш изменился, нужно создать новую версию
-                        IF v_current_hash_diff != rec.hash_diff THEN
-                            -- Закрываем текущую актуальную версию
-                            UPDATE rdv.s_account_transaction 
-                            SET load_end_date = v_load_timestamp
-                            WHERE account_txn_hash_key = rec.account_txn_hash_key
-                              AND load_end_date IS NULL;
-                              
-                            v_sat_updated := v_sat_updated + 1;
-                            
-                            -- Создаем новую версию
-                            INSERT INTO rdv.s_account_transaction (
-                                account_txn_hash_key,
-                                load_date,
-                                hash_diff,
-                                load_end_date,
-                                transaction_date,
-                                amount,
-                                record_source
-                            )
-                            VALUES (
-                                rec.account_txn_hash_key,
-                                v_load_timestamp,
-                                rec.hash_diff,
-                                NULL,  -- Новая актуальная версия
-                                rec.transaction_date,
-                                rec.amount,
-                                rec.record_source
-                            );
-                            
-                            v_sat_inserted := v_sat_inserted + 1;
-                            v_records_processed := v_records_processed + 1;
-                        END IF;
-                        
-                    EXCEPTION
-                        WHEN NO_DATA_FOUND THEN
-                            -- Актуальной записи нет - вставляем первую версию
-                            INSERT INTO rdv.s_account_transaction (
-                                account_txn_hash_key,
-                                load_date,
-                                hash_diff,
-                                load_end_date,
-                                transaction_date,
-                                amount,
-                                record_source
-                            )
-                            VALUES (
-                                rec.account_txn_hash_key,
-                                v_load_timestamp,
-                                rec.hash_diff,
-                                NULL,  -- Первая актуальная версия
-                                rec.transaction_date,
-                                rec.amount,
-                                rec.record_source
-                            );
-                            
-                            v_sat_inserted := v_sat_inserted + 1;
-                            v_records_processed := v_records_processed + 1;
-                        WHEN TOO_MANY_ROWS THEN
-                            -- Несколько актуальных записей - ошибка в данных
-                            v_error_message := 'Найдено несколько актуальных версий для account_txn_hash_key=' || rec.account_txn_hash_key;
-                            DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                            
-                            INSERT INTO flow.load_error_log (
-                                procedure_name,
-                                error_message,
-                                transaction_id,
-                                record_data
-                            ) VALUES (
-                                'LOAD_ACCOUNT_TRANSACTION_SATELLITE',
-                                v_error_message,
-                                rec.transaction_id,
-                                'transaction_date=' || TO_CHAR(rec.transaction_date, 'DD.MM.YYYY')
-                                || ', amount=' || rec.amount
-                            );
-                    END;
+                    select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                    join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                    where lta.transaction_rk = rec.TRANSACTION_RK;
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
+                    v_sat_updated := v_sat_updated + 1;
+                EXCEPTION
+                  when NO_DATA_FOUND then 
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = rec.TRANSACTION_DEBACC_CREDACC_RK;
+                    v_sat_updated := v_sat_updated + 1;
                 END;
-                
-                -- Логирование прогресса
-                --IF MOD(v_records_processed, 1000) = 0 THEN
-                --    DBMS_OUTPUT.PUT_LINE('Обработано записей: ' || v_records_processed);
-                --END IF;
-                
-            EXCEPTION
-                WHEN OTHERS THEN
-                    v_error_message := 'Ошибка при обработке transaction_id=' || rec.transaction_id || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        transaction_id,
-                        record_data
-                    ) VALUES (
-                        'LOAD_ACCOUNT_TRANSACTION_SATELLITE',
-                        v_error_message,
-                        rec.transaction_id,
-                        'transaction_date=' || TO_CHAR(rec.transaction_date, 'DD.MM.YYYY')
-                        || ', amount=' || rec.amount
-                    );
-            END;
-        END LOOP;
-        
-        COMMIT;
-        
-        DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Статистика:');
-        DBMS_OUTPUT.PUT_LINE('  - Обновлено в спутнике: ' || v_sat_updated);
-        DBMS_OUTPUT.PUT_LINE('  - Вставлено в спутнике: ' || v_sat_inserted);
-        DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
-        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            v_error_message := 'Критическая ошибка при загрузке сателлита: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE;
-    END;
+
+              ELSE
+                -- Если линка нет, то находим старый линк по хэшу транзакции
+                BEGIN
+                    select lta.TRANSACTION_DEBACC_CREDACC_RK into v_lta_rk from RDV2.L_TRANSACTION_ACCOUNT lta 
+                    join RDV2.S_TRANSACTION_ACCOUNT sta on (sta.TRANSACTION_DEBACC_CREDACC_RK = lta.TRANSACTION_DEBACC_CREDACC_RK and sta.valid_flg = '1')
+                    where lta.transaction_rk = rec.TRANSACTION_RK;
+                    update RDV2.S_TRANSACTION_ACCOUNT sta set sta.valid_flg = '0', sta.valid_to = v_load_timestamp 
+                    where sta.TRANSACTION_DEBACC_CREDACC_RK = v_lta_rk;
+                    v_sat_updated := v_sat_updated + 1;
+                EXCEPTION
+                  when NO_DATA_FOUND then v_lta_rk :='none';
+                END;
+                insert into RDV2.L_TRANSACTION_ACCOUNT
+                (transaction_debacc_credacc_rk, transaction_rk, debit_account_rk, credit_account_rk, load_date, record_source)
+                values (rec.transaction_debacc_credacc_rk, rec.transaction_rk, rec.debit_account_rk, rec.credit_account_rk, rec.load_date, rec.record_source);
+                v_lnk_inserted := v_lnk_inserted + 1;
+              END IF;
+              insert into RDV2.S_TRANSACTION_ACCOUNT 
+              (transaction_debacc_credacc_rk, valid_from, valid_to, transaction_date, amount, valid_flg, load_date, hash_diff, record_source)
+              values (rec.transaction_debacc_credacc_rk, v_load_timestamp, TO_DATE('2999.12.31','yyyy.mm.dd'), rec.transaction_date, rec.amount, '1', v_load_timestamp, rec.hash_diff, v_src);
+              
+              v_sat_inserted := v_sat_inserted + 1;
+              v_records_processed := v_records_processed + 1;
+            END IF;
+          END;
+      END;
+    END LOOP;
     
-END load_account_transaction_satellite;
+    COMMIT;
+    
+    DBMS_OUTPUT.PUT_LINE('Загрузка завершена успешно.');
+    DBMS_OUTPUT.PUT_LINE('Статистика:');
+    IF v_dummy_detected then DBMS_OUTPUT.PUT_LINE('Обнаружены dummy-записи. Требуется прогрузка хабов'); END IF;
+    DBMS_OUTPUT.PUT_LINE('  - Вставлено в линк: ' || v_lnk_inserted);
+    DBMS_OUTPUT.PUT_LINE('  - Вставлено в саттелит: ' || v_sat_inserted);
+    DBMS_OUTPUT.PUT_LINE('  - Обновлено в саттелите: ' || v_sat_updated);
+    DBMS_OUTPUT.PUT_LINE('  - Всего обработано записей: ' || v_records_processed);
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('Ошибка при загрузке иерархии: ' || SQLERRM);
+        RAISE;
+END wrk_stg_rdv_lnk_transaction_account;
 /
 
-CREATE OR REPLACE PROCEDURE flow.load_pit_account (
-    p_snapshot_date IN DATE DEFAULT NULL
-)
-IS
-    v_snapshot_date     DATE := NVL(p_snapshot_date, TRUNC(SYSDATE));
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    -- Курсор для получения актуальных версий счетов на snapshot_date
-    CURSOR c_account_snapshots IS
-        WITH current_sat_versions AS (
-            SELECT 
-                ha.account_hash_key,
-                ha.account_id,
-                sa.load_date as sat_load_date,
-                sa.hash_diff as sat_hash_key,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ha.account_hash_key 
-                    ORDER BY sa.load_date DESC
-                ) as rn
-            FROM rdv.h_account ha
-            JOIN rdv.s_account sa ON ha.account_hash_key = sa.account_hash_key
-            WHERE sa.load_date <= v_snapshot_date
-              AND (sa.load_end_date IS NULL OR sa.load_end_date > v_snapshot_date)
-        )
-        SELECT 
-            account_hash_key,
-            sat_load_date,
-            sat_hash_key
-        FROM current_sat_versions
-        WHERE rn = 1;
-
-BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки PIT-таблицы для счетов на дату: ' || TO_CHAR(v_snapshot_date, 'DD.MM.YYYY'));
-    DBMS_OUTPUT.PUT_LINE('Время загрузки: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    -- Проверяем, есть ли уже запись для этой даты
-    DECLARE
-        v_existing_records NUMBER;
-    BEGIN
-        SELECT COUNT(*)
-        INTO v_existing_records
-        FROM rdv.pit_account
-        WHERE snapshot_date = v_snapshot_date;
-        
-        IF v_existing_records > 0 THEN
-            DBMS_OUTPUT.PUT_LINE('Внимание: Для даты ' || TO_CHAR(v_snapshot_date, 'DD.MM.YYYY') 
-                               || ' уже существуют записи (' || v_existing_records || ' шт.).');
-            DBMS_OUTPUT.PUT_LINE('Удаление существующих записей...');
-            
-            DELETE FROM rdv.pit_account
-            WHERE snapshot_date = v_snapshot_date;
-            
-            DBMS_OUTPUT.PUT_LINE('Удалено записей: ' || SQL%ROWCOUNT);
-        END IF;
-    END;
-
-    BEGIN
-        FOR rec IN c_account_snapshots LOOP
-            BEGIN
-                -- Вставка в PIT-таблицу
-                INSERT INTO rdv.pit_account (
-                    account_hash_key,
-                    snapshot_date,
-                    s_account_hash_key,
-                    load_date
-                )
-                VALUES (
-                    rec.account_hash_key,
-                    v_snapshot_date,
-                    rec.sat_hash_key,
-                    v_load_timestamp
-                );
-                
-                v_records_processed := v_records_processed + 1;
-                
-                -- Логирование прогресса
-                IF MOD(v_records_processed, 1000) = 0 THEN
-                    DBMS_OUTPUT.PUT_LINE('Обработано записей: ' || v_records_processed);
-                END IF;
-                
-            EXCEPTION
-                WHEN DUP_VAL_ON_INDEX THEN
-                    -- Дублирующая запись (маловероятно после удаления)
-                    v_error_message := 'Дублирующая запись для account_hash_key=' || rec.account_hash_key;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                WHEN OTHERS THEN
-                    v_error_message := 'Ошибка при обработке account_hash_key=' || rec.account_hash_key || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        record_data
-                    ) VALUES (
-                        'LOAD_PIT_ACCOUNT',
-                        v_error_message,
-                        'account_hash_key=' || rec.account_hash_key
-                        || ', snapshot_date=' || TO_CHAR(v_snapshot_date, 'DD.MM.YYYY')
-                    );
-            END;
-        END LOOP;
-        
-        COMMIT;
-        
-        DBMS_OUTPUT.PUT_LINE('Загрузка PIT-таблицы завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Всего загружено записей: ' || v_records_processed);
-        
-        -- Создаем индекс для улучшения производительности запросов
-        DBMS_OUTPUT.PUT_LINE('Оптимизация индексов...');
-        EXECUTE IMMEDIATE 'ALTER INDEX RDV.PIT_ACCOUNT_PK REBUILD';
-        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            v_error_message := 'Критическая ошибка при загрузке PIT-таблицы: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE;
-    END;
-    
-END load_pit_account;
-/
-
-CREATE OR REPLACE PROCEDURE flow.load_pit_account (
-    p_snapshot_date IN DATE DEFAULT NULL
-)
-IS
-    v_snapshot_date     DATE := NVL(p_snapshot_date, TRUNC(SYSDATE));
-    v_load_timestamp    DATE := SYSDATE;
-    v_records_processed NUMBER := 0;
-    v_error_message     VARCHAR2(4000);
-    
-    -- Курсор для получения актуальных версий счетов на snapshot_date
-    CURSOR c_account_snapshots IS
-        WITH current_sat_versions AS (
-            SELECT 
-                ha.account_hash_key,
-                ha.account_id,
-                sa.load_date as sat_load_date,
-                sa.hash_diff as sat_hash_key,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ha.account_hash_key 
-                    ORDER BY sa.load_date DESC
-                ) as rn
-            FROM rdv.h_account ha
-            JOIN rdv.s_account sa ON ha.account_hash_key = sa.account_hash_key
-            WHERE sa.load_date <= v_snapshot_date
-              AND (sa.load_end_date IS NULL OR sa.load_end_date > v_snapshot_date)
-        )
-        SELECT 
-            account_hash_key,
-            sat_load_date,
-            sat_hash_key
-        FROM current_sat_versions
-        WHERE rn = 1;
-
-BEGIN
-    DBMS_OUTPUT.PUT_LINE('Начало загрузки PIT-таблицы для счетов на дату: ' || TO_CHAR(v_snapshot_date, 'DD.MM.YYYY'));
-    DBMS_OUTPUT.PUT_LINE('Время загрузки: ' || TO_CHAR(v_load_timestamp, 'DD.MM.YYYY HH24:MI:SS'));
-
-    -- Удаляем существующие записи для этой даты
-    DELETE FROM rdv.pit_account
-    WHERE snapshot_date = v_snapshot_date;
-    
-    v_records_processed := SQL%ROWCOUNT;
-    
-    IF v_records_processed > 0 THEN
-        DBMS_OUTPUT.PUT_LINE('Удалено существующих записей: ' || v_records_processed);
-    END IF;
-
-    BEGIN
-        FOR rec IN c_account_snapshots LOOP
-            BEGIN
-                -- Вставка в PIT-таблицу
-                INSERT INTO rdv.pit_account (
-                    account_hash_key,
-                    snapshot_date,
-                    s_account_hash_key,
-                    load_date
-                )
-                VALUES (
-                    rec.account_hash_key,
-                    v_snapshot_date,
-                    rec.sat_hash_key,
-                    v_load_timestamp
-                );
-                
-            EXCEPTION
-                WHEN OTHERS THEN
-                    v_error_message := 'Ошибка при обработке account_hash_key=' || rec.account_hash_key || ': ' || SQLERRM;
-                    DBMS_OUTPUT.PUT_LINE('Ошибка: ' || v_error_message);
-                    
-                    INSERT INTO flow.load_error_log (
-                        procedure_name,
-                        error_message,
-                        record_data
-                    ) VALUES (
-                        'LOAD_PIT_ACCOUNT',
-                        v_error_message,
-                        'account_hash_key=' || rec.account_hash_key
-                        || ', snapshot_date=' || TO_CHAR(v_snapshot_date, 'DD.MM.YYYY')
-                    );
-            END;
-        END LOOP;
-        
-        v_records_processed := SQL%ROWCOUNT;
-        COMMIT;
-        
-        DBMS_OUTPUT.PUT_LINE('Загрузка PIT-таблицы завершена успешно.');
-        DBMS_OUTPUT.PUT_LINE('Всего загружено записей: ' || v_records_processed);
-        
-        -- Анализируем таблицу для обновления статистики
-/*        DBMS_STATS.GATHER_TABLE_STATS(
-            ownname => 'RDV',
-            tabname => 'PIT_ACCOUNT',
-            estimate_percent => DBMS_STATS.AUTO_SAMPLE_SIZE,
-            method_opt => 'FOR ALL COLUMNS SIZE AUTO',
-            cascade => TRUE
-        );
-        
-        DBMS_OUTPUT.PUT_LINE('Статистика таблицы обновлена.');
-*/        
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-            v_error_message := 'Критическая ошибка при загрузке PIT-таблицы: ' || SQLERRM;
-            DBMS_OUTPUT.PUT_LINE('Критическая ошибка: ' || v_error_message);
-            RAISE;
-    END;
-    
-END load_pit_account;
-/
-
-CREATE OR REPLACE PROCEDURE flow.run_complete_dv_load
+CREATE OR REPLACE PROCEDURE flow.cf_stg_rdv_complete_load (v_src in varchar2, v_days_ago in number)
 IS
     v_start_time TIMESTAMP;
     v_end_time TIMESTAMP;
@@ -906,23 +333,24 @@ BEGIN
     
     -- Шаг 1: Загрузка счетов
     DBMS_OUTPUT.PUT_LINE(CHR(10) || '1. Загрузка счетов...');
-    flow.load_account_from_stg_to_rdv;
+    flow.wrk_stg_rdv_hub_account;
     
     -- Шаг 2: Загрузка иерархии счетов
     DBMS_OUTPUT.PUT_LINE(CHR(10) || '2. Загрузка иерархии счетов...');
-    flow.load_account_hierarchy;
+    flow.wrk_stg_rdv_lnk_account_account;
     
-    -- Шаг 3: Загрузка транзакций
-    DBMS_OUTPUT.PUT_LINE(CHR(10) || '3. Загрузка транзакций...');
-    flow.load_transaction_from_stg_to_rdv;
+    -- Шаг 3: Загрузка сателлита счетов
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '3. Загрузка сателлита счетов...');
+    flow.wrk_stg_rdv_sat_account (v_src, v_days_ago);
+
+    -- Шаг 4: Загрузка транзакций
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '4. Загрузка транзакций...');
+    flow.wrk_stg_rdv_hub_transaction;
     
-    -- Шаг 4: Загрузка связей счет-транзакция
-    DBMS_OUTPUT.PUT_LINE(CHR(10) || '4. Загрузка связей счет-транзакция...');
-    flow.load_account_transaction_link;
-    
-    -- Шаг 5: Загрузка сателлита связей
-    DBMS_OUTPUT.PUT_LINE(CHR(10) || '5. Загрузка сателлита связей счет-транзакция...');
-    flow.load_account_transaction_satellite;
+    -- Шаг 5: Загрузка связей счет-транзакция и их саттелитов
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '5. Загрузка связей счет-транзакция и их саттелитов...');
+    flow.wrk_stg_rdv_lnk_transaction_account (v_src, v_days_ago);
+
     
     -- Шаг 6: Загрузка PIT-таблицы
 --    DBMS_OUTPUT.PUT_LINE(CHR(10) || '6. Загрузка PIT-таблицы для счетов...');
@@ -931,7 +359,7 @@ BEGIN
     v_end_time := SYSTIMESTAMP;
     
     DBMS_OUTPUT.PUT_LINE(CHR(10) || '========================================');
-    DBMS_OUTPUT.PUT_LINE('Загрузка Data Vault завершена');
+    DBMS_OUTPUT.PUT_LINE('Загрузка Raw Data Vault завершена');
     DBMS_OUTPUT.PUT_LINE('Время окончания: ' || TO_CHAR(v_end_time, 'DD.MM.YYYY HH24:MI:SS'));
     DBMS_OUTPUT.PUT_LINE('Общее время выполнения: ' || 
                          EXTRACT(MINUTE FROM (v_end_time - v_start_time)) || ' мин. ' ||
@@ -942,7 +370,7 @@ EXCEPTION
     WHEN OTHERS THEN
         DBMS_OUTPUT.PUT_LINE(CHR(10) || 'ОШИБКА при выполнении загрузки: ' || SQLERRM);
         RAISE;
-END run_complete_dv_load;
+END cf_stg_rdv_complete_load;
 /
 
 -- 1. Исправленная процедура загрузки бриджа для связи счетов с транзакциями
