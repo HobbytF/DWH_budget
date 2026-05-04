@@ -82,5 +82,5 @@ select * from IDL.load_tracking;
 -- FLOW
 
 SET SERVEROUTPUT ON;
-exec flow.cf_stg_rdv_complete_load ('YAST', 30);
+exec flow.cf_stg_rdv_complete_load ('YAST', 50);
 exec flow.run_incremental_idl_load;

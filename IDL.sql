@@ -104,3 +104,11 @@ WHEN NOT MATCHED THEN
     VALUES (src.table_name, src.last_load_date);
 
 COMMIT;
+
+-- PIT для счетов
+CREATE TABLE IDL.pit_account (
+    account_rk          VARCHAR2(64),
+    load_date           DATE,           -- Дата загрузки
+    s_account_valid_from DATE,          -- Актуальный саттелит на этот момент
+    PRIMARY KEY (account_rk, load_date)
+);

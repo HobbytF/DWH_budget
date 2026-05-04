@@ -319,6 +319,7 @@ EXCEPTION
 END wrk_stg_rdv_lnk_transaction_account;
 /
 
+-- Управляющий поток по загрузке STG -> RDV
 CREATE OR REPLACE PROCEDURE flow.cf_stg_rdv_complete_load (v_src in varchar2, v_days_ago in number)
 IS
     v_start_time TIMESTAMP;
