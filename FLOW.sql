@@ -373,7 +373,7 @@ EXCEPTION
         RAISE;
 END cf_stg_rdv_complete_load;
 /
-
+/*
 -- 1. Исправленная процедура загрузки бриджа для связи счетов с транзакциями
 CREATE OR REPLACE PROCEDURE flow.load_bridge_account_transaction
 IS
@@ -616,8 +616,8 @@ BEGIN
             JOIN rdv.l_account_account laa ON LOWER(STANDARD_HASH(ah.account_id, 'MD5')) = laa.parent_account_hash_key
             JOIN rdv.h_account ha_child ON laa.child_account_hash_key = ha_child.account_hash_key
             JOIN rdv.s_account sa_child ON ha_child.account_hash_key = sa_child.account_hash_key AND sa_child.load_end_date IS NULL
-/*            JOIN rdv.h_account ha_parent ON ah.account_id = ha_parent.account_id
-            JOIN rdv.s_account sa_parent ON ha_parent.account_hash_key = sa_parent.account_hash_key AND sa_parent.load_end_date IS NULL*/
+--            JOIN rdv.h_account ha_parent ON ah.account_id = ha_parent.account_id
+--            JOIN rdv.s_account sa_parent ON ha_parent.account_hash_key = sa_parent.account_hash_key AND sa_parent.load_end_date IS NULL
         )
         SELECT 
             account_id,
@@ -924,3 +924,4 @@ EXCEPTION
         RAISE;
 END run_incremental_idl_load;
 /
+*/
