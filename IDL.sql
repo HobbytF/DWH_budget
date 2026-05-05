@@ -1,3 +1,4 @@
+/*
 -- 1. Бридж для связи счетов с транзакциями
 CREATE TABLE IDL.bridge_account_transaction (
     transaction_id          NUMBER(10) NOT NULL,
@@ -112,3 +113,63 @@ CREATE TABLE IDL.pit_account (
     s_account_valid_from DATE,          -- Актуальный саттелит на этот момент
     PRIMARY KEY (account_rk, load_date)
 );
+*/
+
+drop table IDL.bridge_transaction_account;
+-- Bridge для связи транзакций со счетами
+CREATE TABLE IDL.bridge_transaction_account (
+    bridge_rk           VARCHAR2(64),
+    transaction_rk      VARCHAR2(64),
+    debit_account_rk    VARCHAR2(64),
+    credit_account_rk   VARCHAR2(64),
+    transaction_date    DATE,
+    amount              NUMBER(10,2),
+    valid_from          DATE,
+    valid_to            DATE,
+    load_date           DATE,
+    record_source       VARCHAR2(50),         -- Источник записи
+    PRIMARY KEY (bridge_rk)
+);
+
+DECLARE 
+    v_load_timestamp    DATE := SYSDATE;
+    v_src               VARCHAR2(50) := 'YAST';
+BEGIN
+    delete from IDL.bridge_transaction_account;
+    INSERT INTO IDL.bridge_transaction_account (
+        bridge_rk,
+        transaction_rk,
+        debit_account_rk,
+        credit_account_rk,
+        transaction_date,
+        amount,
+        valid_from,
+        valid_to,
+        load_date,
+        record_source
+    )    
+    SELECT 
+        LOWER(STANDARD_HASH(
+            lta.transaction_rk || lta.debit_account_rk || 
+            lta.credit_account_rk || TO_CHAR(sta.valid_from, 'YYYYMMDD'),
+            'MD5'
+        )) as bridge_rk,
+        lta.transaction_rk,
+        lta.debit_account_rk,
+        lta.credit_account_rk,
+        sta.transaction_date,
+        sta.amount,
+        sta.valid_from,
+        NVL(sta.valid_to, TO_DATE('2999-12-31', 'YYYY-MM-DD')) AS valid_to,
+        v_load_timestamp AS load_date,
+        v_src
+    FROM RDV2.l_transaction_account lta
+    JOIN RDV2.s_transaction_account sta 
+        ON lta.transaction_debacc_credacc_rk = sta.transaction_debacc_credacc_rk --and sta.RECORD_SOURCE = v_src and lta.RECORD_SOURCE = v_src
+    WHERE sta.valid_flg = '1';
+
+    commit;
+END;
+/
+
+select * from IDL.bridge_transaction_account;
