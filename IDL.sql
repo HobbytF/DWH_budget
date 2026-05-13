@@ -161,7 +161,7 @@ BEGIN
         sta.amount,
         sta.valid_from,
         NVL(sta.valid_to, TO_DATE('2999-12-31', 'YYYY-MM-DD')) AS valid_to,
-        v_load_timestamp AS load_date,
+        v_load_timestamp AS load_date,  
         v_src
     FROM RDV2.l_transaction_account lta
     JOIN RDV2.s_transaction_account sta 
@@ -172,4 +172,30 @@ BEGIN
 END;
 /
 
-select * from IDL.bridge_transaction_account;
+CREATE TABLE IDL.bridge_account (
+    bridge_account_rk   VARCHAR2(64),
+    account_rk          VARCHAR2(64),
+    account_id          VARCHAR2(16),
+    account_name        VARCHAR2(100),
+    level_number        NUMBER(5),
+    valid_from          DATE,
+    valid_to            DATE,
+    load_date           DATE,
+    record_source       VARCHAR2(50),         -- Источник записи
+    PRIMARY KEY (bridge_account_rk)
+);
+
+SELECT
+    LOWER(STANDARD_HASH(ha.ACCOUNT_RK || sa.ACCOUNT_NAME || TO_CHAR(sa.VALID_FROM, 'YYYYMMDD'), 'MD5')) as bridge_account_rk,
+	ha.ACCOUNT_RK ,
+	ha.ACCOUNT_ID ,
+	sa.ACCOUNT_NAME,
+	flow.get_account_level_number(ha.ACCOUNT_RK) AS level_number,
+	sa.VALID_FROM,
+	NVL(sa.valid_to, TO_DATE('2999-12-31', 'YYYY-MM-DD')) AS valid_to,
+	SYSDATE AS load_date,
+	'YAST' AS record_source
+FROM rdv2.H_ACCOUNT ha 
+JOIN rdv2.S_ACCOUNT sa on (sa.account_rk = ha.account_rk)
+WHERE sa.VALID_FLG = '1'
+order by 5;

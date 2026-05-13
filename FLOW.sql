@@ -9,6 +9,26 @@ CREATE TABLE FLOW.load_error_log (
     record_data     CLOB
 );
 
+-- вспомогательная функция для определения вложенности уровня счета
+CREATE OR REPLACE FUNCTION flow.get_account_level_number(v_acc VARCHAR2)
+RETURN NUMBER
+IS
+	v_lvl       NUMBER(5) := 0;
+    v_current   VARCHAR2(64) := v_acc;
+    v_parent    VARCHAR2(64) := v_acc;
+BEGIN
+	WHILE v_current != '-1' LOOP
+		v_lvl := v_lvl + 1;
+		BEGIN
+			SELECT PARENT_ACCOUNT_RK INTO v_current FROM rdv2.l_account_account WHERE CHILD_ACCOUNT_RK = v_parent;
+		EXCEPTION WHEN NO_DATA_FOUND THEN v_current := '-1';
+		END;
+        v_parent := v_current;
+	END LOOP;
+	RETURN v_lvl;
+END;
+/
+
 -- Загрузка хаба счетов
 CREATE OR REPLACE PROCEDURE flow.wrk_stg_rdv_hub_account 
 IS
